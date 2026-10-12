@@ -21,6 +21,7 @@ import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileRange;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.impl.FileRangeImpl;
 import org.apache.hadoop.hive.common.io.DiskRangeList;
 import org.apache.hadoop.util.VersionInfo;
 import org.apache.orc.CompressionCodec;
@@ -39,6 +40,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.function.IntFunction;
 import java.util.function.Supplier;
@@ -110,7 +112,7 @@ public class RecordReaderUtils {
                                         boolean doForceDirect
                                         ) throws IOException {
       if (supportVectoredIO && zcr == null) {
-        RecordReaderUtils.readDiskRangesVectored(file, range, doForceDirect);
+        RecordReaderUtils.readDiskRangesVectored(file, range, doForceDirect, minSeekSize);
       } else {
         RecordReaderUtils.readDiskRanges(file, zcr, range, doForceDirect,
                                          minSeekSize, minSeekSizeTolerance);
@@ -564,37 +566,302 @@ public class RecordReaderUtils {
   }
 
   /**
-   * Read the list of ranges from the file by updating each range in the list
+   * Maximum length of any single coalesced {@link FileRange} we are willing to
+   * emit. Mirrors {@link IOUtils#MAX_ARRAY_SIZE} so that downstream buffer
+   * allocation never silently wraps to a negative int or to a smaller positive
+   * value than requested.
+   */
+  private static final int MAX_FILE_RANGE_LENGTH = IOUtils.MAX_ARRAY_SIZE;
+
+  /**
+   * Snapshot of a {@link BufferChunk} sufficient to drive coalescing decisions
+   * without holding an actual chunk or backing buffer. Used to test the
+   * length-bounded coalescing logic without allocating multi-GB byte arrays.
+   */
+  static final class CoalesceEntry {
+    final long offset;
+    final int length;
+    final boolean hasData;
+
+    CoalesceEntry(long offset, int length, boolean hasData) {
+      this.offset = offset;
+      this.length = length;
+      this.hasData = hasData;
+    }
+
+    long end() {
+      return offset + length;
+    }
+  }
+
+  /**
+   * Compute the list of {@link FileRange}s that would be emitted for the given
+   * ordered list of coalescing entries. Honours filled-chunk boundaries, the
+   * gap==0/overlap merge rule, and the {@link #MAX_FILE_RANGE_LENGTH} size
+   * cap; the merged span is computed in {@code long} arithmetic so very large
+   * offsets never wrap.
+   * <p>
+   * Exposed package-private so unit tests can drive coalescing with controlled
+   * inputs (including offsets near {@link Integer#MAX_VALUE}) without
+   * allocating multi-gigabyte byte buffers.
+   */
+  static List<FileRange> coalesceRanges(List<CoalesceEntry> entries) {
+    return coalesceRanges(entries, 0);
+  }
+
+  /**
+   * Variant of {@link #coalesceRanges(List)} that additionally honours a
+   * bounded small-gap merge: a pending chunk is folded into the in-flight
+   * FileRange when {@code nextOffset - currentEnd <= minSeekSize}, mirroring
+   * the sync-path semantics of {@link #findSingleRead}. Existing invariants
+   * are preserved:
+   * <ul>
+   *   <li>a filled chunk ({@link CoalesceEntry#hasData hasData == true}) is an
+   *       immovable boundary and is never crossed by a gap merge;</li>
+   *   <li>the merged span must remain at most
+   *       {@link #MAX_FILE_RANGE_LENGTH}, otherwise the in-flight range is
+   *       flushed and a new one is started for the current chunk;</li>
+   *   <li>single forward pass over the input, O(n);</li>
+   *   <li>gap computation is performed in {@code long} arithmetic.</li>
+   * </ul>
+   * With {@code minSeekSize == 0} the behaviour is identical to the no-gap
+   * variant (touching/overlap merge only). The vectored path bounds over-read
+   * by {@code minSeekSize} alone; it does not additionally apply
+   * {@code minSeekSizeTolerance} (the tolerance is only applied by the sync
+   * path's {@code ChunkReader}).
+   *
+   * @param entries     ordered list of coalescing entries
+   * @param minSeekSize non-negative tolerance (in bytes) for small gaps that
+   *                    may still be merged into a single FileRange
+   */
+  static List<FileRange> coalesceRanges(List<CoalesceEntry> entries, int minSeekSize) {
+    if (minSeekSize < 0) {
+      throw new IllegalArgumentException(
+          "minSeekSize must be non-negative, got " + minSeekSize);
+    }
+    long minSeekSizeL = (long) minSeekSize;
+    List<FileRange> fileRanges = new ArrayList<>();
+    FileRange currentRange = null;
+    long currentEnd = 0L;
+    for (CoalesceEntry e : entries) {
+      if (e.hasData) {
+        // Already-filled chunks are an immovable boundary.
+        currentRange = null;
+        continue;
+      }
+      // Each individual pending chunk must fit inside a single FileRange:
+      // FileRange lengths are int-typed and capped at MAX_FILE_RANGE_LENGTH
+      // so a caller that requests more than the cap for a single chunk
+      // cannot be served. Reject explicitly instead of letting the merged
+      // FileRange or the downstream allocator silently overflow.
+      if (e.length > MAX_FILE_RANGE_LENGTH) {
+        throw new IllegalArgumentException(
+            "BufferChunk length " + e.length + " exceeds IOUtils.MAX_ARRAY_SIZE "
+                + MAX_FILE_RANGE_LENGTH + " for offset " + e.offset);
+      }
+      long chunkOffset = e.offset;
+      long chunkEnd = e.end();
+      // Merge into the in-flight range when either the chunk touches/overlaps
+      // the current end (gap == 0, i.e. chunkOffset <= currentEnd) OR the
+      // small gap is within the minSeekSize tolerance. Filling across a small
+      // gap mirrors the sync path's findSingleRead semantics.
+      boolean overlaps = (currentRange != null) && (chunkOffset <= currentEnd);
+      boolean smallGap = (currentRange != null) &&
+          (chunkOffset - currentEnd <= minSeekSizeL);
+      if (overlaps || smallGap) {
+        long newEnd = Math.max(currentEnd, chunkEnd);
+        long mergedLength = newEnd - currentRange.getOffset();
+        if (mergedLength > MAX_FILE_RANGE_LENGTH) {
+          // Adding this chunk (including its bounded over-read) would
+          // overflow the safe single-range length bound; flush and start a
+          // fresh range for the current chunk.
+          currentRange = FileRange.createFileRange(chunkOffset, e.length);
+          fileRanges.add(currentRange);
+          currentEnd = chunkEnd;
+        } else {
+          // Replace the in-flight range with one whose length is the final
+          // merged span. Building a fresh FileRange keeps coalesceRanges free
+          // of any FileRangeImpl-specific mutation; the cap above guarantees
+          // the cast back to int is safe.
+          long baseOffset = currentRange.getOffset();
+          currentRange = FileRange.createFileRange(baseOffset, (int) mergedLength);
+          fileRanges.set(fileRanges.size() - 1, currentRange);
+          currentEnd = newEnd;
+        }
+      } else {
+        // Non-contiguous (gap > minSeekSize) or first range: start a fresh
+        // FileRange.
+        currentRange = FileRange.createFileRange(chunkOffset, e.length);
+        fileRanges.add(currentRange);
+        currentEnd = chunkEnd;
+      }
+    }
+    return fileRanges;
+  }
+
+  /**
+   * Read the list of ranges from the file by updating each range in the list.
+   * <p>
+   * Phase 1 coalescing: ranges within the same batch that are contiguous or
+   * overlapping (offset &le; current aggregated end, i.e. gap = 0) are merged
+   * into a single {@link FileRange}. Already-filled chunks
+   * ({@link BufferChunk#hasData()} returns true) are never crossed - they act
+   * as a boundary. There is no over-read across gaps, and coalescing never
+   * spans past the current batch because we iterate the list once in order
+   * and only look at the immediately preceding pending chunk.
+   * <p>
+   * Phase 3 coalescing: in addition to Phase 1, a bounded small-gap merge is
+   * honoured - a chunk is folded into the in-flight FileRange when
+   * {@code nextOffset - currentEnd <= minSeekSize}. This mirrors the sync
+   * path's {@link #findSingleRead} rule so callers using vectored I/O do not
+   * regress on minSeekSize-bounded workloads (e.g. Hadoop's TestMinSeekSize
+   * which expects ~106% reads with minSeekSize=1MB). The tolerance is
+   * applied in {@code long} arithmetic; filled-chunk boundaries and the
+   * {@link #MAX_FILE_RANGE_LENGTH} cap remain hard limits. Note: the
+   * vectored path does NOT additionally apply
+   * {@code minSeekSizeTolerance} (that tolerance lives only on the sync
+   * path's {@code ChunkReader}); over-read in the vectored path is bounded
+   * by {@code minSeekSize} alone. With {@code minSeekSize == 0} the
+   * behaviour is exactly the Phase 1 gap==0 / overlap-only merge.
+   * <p>
+   * The merged span is computed in {@code long} arithmetic; if growing the
+   * in-flight range would push its length past
+   * {@link #MAX_FILE_RANGE_LENGTH} the range is flushed and a new one is
+   * started for the current chunk. This avoids the silent {@code (int)} wrap
+   * that would otherwise produce a negative or truncated FileRange when caller
+   * offsets approach or exceed {@link Integer#MAX_VALUE}.
+   *
+   * @param fileInputStream the input stream to read from
+   * @param range           the ordered list of disk ranges within the file to
+   *                        read
+   * @param doForceDirect   allocate direct buffers
+   * @param minSeekSize     non-negative minimum gap (in bytes) that is still
+   *                        merged into a single FileRange. {@code 0}
+   *                        disables the bounded gap merge and restores the
+   *                        Phase 1 behaviour exactly.
    */
   private static void readDiskRangesVectored(
       FSDataInputStream fileInputStream,
       BufferChunkList range,
-      boolean doForceDirect) throws IOException {
+      boolean doForceDirect,
+      int minSeekSize) throws IOException {
     if (range == null) return;
 
     IntFunction<ByteBuffer> allocate =
         doForceDirect ? ByteBuffer::allocateDirect : ByteBuffer::allocate;
 
-    var fileRanges = new ArrayList<FileRange>();
-    var map = new HashMap<FileRange, BufferChunk>();
-    var cur = range.get();
+    // Build the snapshot of BufferChunks we want to coalesce.
+    List<CoalesceEntry> entries = new ArrayList<>();
+    for (BufferChunk c = range.get(); c != null; c = (BufferChunk) c.next) {
+      entries.add(new CoalesceEntry(c.getOffset(), c.getLength(), c.hasData()));
+    }
+    List<FileRange> fileRanges = coalesceRanges(entries, minSeekSize);
+
+    // Single-range short-circuit: a single coalesced range whose data the
+    // caller will block on immediately is pure async overhead when routed
+    // through readVectored (executor task + CompletableFuture with no
+    // parallelism benefit). Read it synchronously via the positioned
+    // readFully API and hand the backfill loop a FileRange whose future is
+    // already completed. The backfill/slice logic below is source-agnostic
+    // and works on either path.
+    if (fileRanges.size() == 1) {
+      FileRange only = fileRanges.get(0);
+      long onlyOffset = only.getOffset();
+      int onlyLength = only.getLength();
+      ByteBuffer full = allocate.apply(onlyLength);
+      try {
+        if (doForceDirect) {
+          // Direct buffers cannot be backed by readFully(long, ByteBuffer,
+          // ...). Read into a heap byte[] then copy into the direct buffer,
+          // mirroring the pattern used by readRanges().
+          byte[] tmp = new byte[onlyLength];
+          fileInputStream.readFully(onlyOffset, tmp, 0, onlyLength);
+          full.put(tmp);
+          full.flip();
+        } else {
+          // Heap-backed ByteBuffer: readFully can target its backing array
+          // directly when there is no offset (allocate(...) returns a
+          // position-0, arrayOffset-0 buffer).
+          fileInputStream.readFully(onlyOffset, full.array(), full.arrayOffset(),
+              onlyLength);
+          full.limit(onlyLength);
+        }
+      } catch (IOException e) {
+        throw new IOException(String.format(
+            "Failed while reading %s %d:%d", fileInputStream, onlyOffset, onlyLength), e);
+      }
+      CompletableFuture<ByteBuffer> done = new CompletableFuture<>();
+      done.complete(full);
+      only.setData(done);
+    } else {
+      fileInputStream.readVectored(fileRanges, allocate);
+    }
+
+    // Walk the original BufferChunk list and, for every empty chunk, slice the
+    // coalesced FileRange's buffer to the chunk's exact [offset, end).
+    //
+    // BufferChunks are visited in their original sorted order; fileRanges is
+    // also strictly increasing in offset. We use a single forward-moving
+    // pointer so the total backfill cost is O(chunks + ranges) instead of
+    // O(chunks * ranges).
+    BufferChunk cur = range.get();
+    int rangeIdx = 0;
     while (cur != null) {
       if (!cur.hasData()) {
-        var fileRange = FileRange.createFileRange(cur.getOffset(), cur.getLength());
-        fileRanges.add(fileRange);
-        map.put(fileRange, cur);
+        long chunkOffset = cur.getOffset();
+        long chunkEnd = chunkOffset + cur.getLength();
+        // Skip past any fileRange that ends at or before the chunk start.
+        while (rangeIdx < fileRanges.size() &&
+            (long) fileRanges.get(rangeIdx).getOffset() +
+                fileRanges.get(rangeIdx).getLength() <= chunkOffset) {
+          rangeIdx++;
+        }
+        // The current range may start at or before chunkOffset but end before
+        // chunkEnd (e.g. a pending chunk on each side of an already-filled
+        // boundary chunk whose spans overlap the pending ones). In that case
+        // the range cannot own the chunk; keep scanning forward for a later
+        // range whose start is still <= chunkOffset and whose end reaches
+        // chunkEnd. Because ranges are sorted by offset and non-overlapping,
+        // any such later range is the unique owner. rangeIdx only moves
+        // forward, so the total work across all chunks stays O(chunks +
+        // ranges).
+        FileRange owner = null;
+        while (rangeIdx < fileRanges.size() &&
+            fileRanges.get(rangeIdx).getOffset() <= chunkOffset) {
+          FileRange candidate = fileRanges.get(rangeIdx);
+          if ((long) candidate.getOffset() + candidate.getLength() >= chunkEnd) {
+            owner = candidate;
+            break;
+          }
+          rangeIdx++;
+        }
+        if (owner == null) {
+          throw new IllegalStateException("No FileRange covers BufferChunk " + cur);
+        }
+        try {
+          ByteBuffer full = owner.getData().get();
+          // readVectored may return a buffer whose position() is non-zero
+          // (e.g. ChecksumFileSystem hands back a pre-sliced view). Compute
+          // the absolute slice window using both the buffer's position and
+          // the in-range offset, and reset the slice's position to 0 so
+          // consumers see a clean [0, chunkLen) view of the chunk bytes.
+          int absPos = full.position() + (int) (chunkOffset - owner.getOffset());
+          int absLimit = absPos + cur.getLength();
+          if (absLimit > full.limit()) {
+            throw new IllegalStateException("ByteBuffer underflow for BufferChunk " + cur
+                + ": requested limit " + absLimit + " > buffer limit " + full.limit());
+          }
+          ByteBuffer slice = full.duplicate();
+          slice.position(absPos);
+          slice.limit(absLimit);
+          // Hand the consumer a chunk-sized view starting at 0.
+          slice = slice.slice();
+          cur.setChunk(slice);
+        } catch (InterruptedException | ExecutionException e) {
+          throw new RuntimeException(e);
+        }
       }
       cur = (BufferChunk) cur.next;
-    }
-    fileInputStream.readVectored(fileRanges, allocate);
-
-    for (FileRange r : fileRanges) {
-      cur = map.get(r);
-      try {
-        cur.setChunk(r.getData().get());
-      } catch (InterruptedException | ExecutionException e) {
-        throw new RuntimeException(e);
-      }
     }
   }
 
