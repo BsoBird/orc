@@ -68,6 +68,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
 import java.nio.charset.StandardCharsets;
@@ -88,6 +89,7 @@ import java.util.TimeZone;
 import static org.apache.orc.impl.RecordReaderUtils.MAX_BYTE_WIDTH;
 import static org.apache.orc.impl.RecordReaderUtils.MAX_VALUES_LENGTH;
 import static org.apache.orc.OrcFile.CURRENT_WRITER;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -2932,5 +2934,368 @@ public class TestRecordReaderImpl {
       }
     }
     verify(spied, times(stripeCount)).readStripeFooter(any());
+  }
+
+  // ==========================================================================
+  // PROTOTYPE ONLY -- not shipping code.
+  //
+  // Measures the I/O mechanics of collapsing the index read and the data read
+  // of one small stripe into a single DataReader.readFileData call.
+  //
+  // The two claims under test are narrow on purpose:
+  //   1. the SARG verdict (which row groups survive) and the parsed row index
+  //      are identical whether the bytes arrive in one combined call or in the
+  //      normal phased calls, and
+  //   2. the combined call buys fewer round trips, not fewer bytes: because the
+  //      index is not available yet when the range is planned, it has to be
+  //      planned as "all data", so it pays for the all-skipped row group up
+  //      front. The byte accounting below is what the prototype is really
+  //      demonstrating -- the win is contiguity/call count, and the cost is the
+  //      bytes of skipped row groups that the phased path would have skipped.
+  //
+  // No production file is modified. StripePlanner.planIndexReading and
+  // StripePlanner.planDataReading are private, so the test reaches them by
+  // reflection to obtain the planner's own ranges rather than re-deriving
+  // them; everything downstream of that (readFileData, the InStream/protobuf
+  // index parse, SargApplier.pickRowGroups) is the unmodified production path.
+  // ==========================================================================
+
+  /** Row index stride of the prototype fixture: 2000 rows => 2 row groups. */
+  private static final long CO_READ_ROW_INDEX_STRIDE = 1000;
+
+  /** Byte length of the x DATA stream in the prototype fixture. */
+  private static final int CO_READ_X_DATA = 99000;
+  /** Row-group-1 start recorded in the x row index. */
+  private static final int CO_READ_X_RG1 = 10000;
+  /** Byte length of the y DATA stream in the prototype fixture. */
+  private static final int CO_READ_Y_DATA = 198000;
+  /** Row-group-1 start recorded in the y row index. */
+  private static final int CO_READ_Y_RG1 = 20000;
+
+  /**
+   * A row index entry carrying the positions and the integer statistics that
+   * SargApplier needs. For an uncompressed INT column with a DIRECT encoding
+   * and a PRESENT stream, RecordReaderUtils.getIndexPosition returns slot 0 for
+   * PRESENT and slot 3 (BITFIELD_POSITIONS) for DATA; slots 1 and 2 are unused
+   * for this shape.
+   */
+  private static OrcProto.RowIndexEntry coReadIndexEntry(int presentPos,
+                                                         int dataPos,
+                                                         Long min,
+                                                         Long max) {
+    return OrcProto.RowIndexEntry.newBuilder()
+        .addPositions(presentPos)
+        .addPositions(-1)
+        .addPositions(-1)
+        .addPositions(dataPos)
+        .setStatistics(createIntStats(min, max))
+        .build();
+  }
+
+  /**
+   * One stripe, two row groups of 1000 rows.
+   *
+   * row group 0: x in [100,200], y in [11,20]  -> selected by x=150 AND y=15
+   * row group 1: x in [0,10],   y in [0,9]    -> all skipped by x=150
+   *
+   * Row group 1 is deliberately the LAST one: production's
+   * planPartialDataReading only shortens a selected row group's end offset when
+   * a later group exists, so putting the skipped group last is what makes the
+   * phased path stop short of the end of each data stream.
+   */
+  private static MockDataReader createCoReadFixture(TypeDescription schema) {
+    return new MockDataReader(schema)
+        .addStream(1, OrcProto.Stream.Kind.ROW_INDEX,
+            createRowIndex(
+                coReadIndexEntry(0, 0, 100L, 200L),
+                coReadIndexEntry(CO_READ_X_RG1, CO_READ_X_RG1, 0L, 10L)))
+        .addStream(2, OrcProto.Stream.Kind.ROW_INDEX,
+            createRowIndex(
+                coReadIndexEntry(0, 0, 11L, 20L),
+                coReadIndexEntry(CO_READ_Y_RG1, CO_READ_Y_RG1, 0L, 9L)))
+        .addStream(1, OrcProto.Stream.Kind.PRESENT, createDataStream(1, 1000))
+        .addStream(1, OrcProto.Stream.Kind.DATA, createDataStream(2, CO_READ_X_DATA))
+        .addStream(2, OrcProto.Stream.Kind.PRESENT, createDataStream(3, 2000))
+        .addStream(2, OrcProto.Stream.Kind.DATA, createDataStream(4, CO_READ_Y_DATA))
+        .addStripeFooter(2000, null);
+  }
+
+  /**
+   * x = 150 AND y = 15, applied through the production SargApplier.
+   */
+  private static boolean[] pickCoReadRowGroups(TypeDescription schema,
+                                               MockStripe stripe,
+                                               OrcIndex index)
+      throws IOException {
+    Configuration conf = new Configuration();
+    SchemaEvolution evolution = new SchemaEvolution(schema, schema,
+        new Reader.Options(conf));
+    SearchArgument sarg = SearchArgumentFactory.newBuilder()
+        .startAnd()
+        .equals("x", PredicateLeaf.Type.LONG, 150L)
+        .equals("y", PredicateLeaf.Type.LONG, 15L)
+        .end().build();
+    SargApplier applier = new SargApplier(sarg, CO_READ_ROW_INDEX_STRIDE, evolution,
+        OrcFile.WriterVersion.ORC_135, false, false, false);
+    return applier.pickRowGroups(stripe, index.getRowGroupIndex(),
+        index.getBloomFilterKinds(), stripe.getFooter().getColumnsList(),
+        index.getBloomFilterIndex(), false);
+  }
+
+  private static BufferChunkList planIndexRanges(StripePlanner planner,
+                                                 boolean[] bloomFilterColumns)
+      throws Exception {
+    Method method = StripePlanner.class
+        .getDeclaredMethod("planIndexReading", boolean[].class);
+    method.setAccessible(true);
+    return (BufferChunkList) method.invoke(planner, (Object) bloomFilterColumns);
+  }
+
+  private static BufferChunkList planDataRanges(StripePlanner planner,
+                                                TypeReader.ReadPhase readPhase)
+      throws Exception {
+    Method method = StripePlanner.class
+        .getDeclaredMethod("planDataReading", TypeReader.ReadPhase.class);
+    method.setAccessible(true);
+    return (BufferChunkList) method.invoke(planner, readPhase);
+  }
+
+  /**
+   * Flatten two chunk lists into one. The chunks are snapshotted first because
+   * BufferChunkList.add rewrites prev/next pointers and would otherwise splice
+   * the two lists together underneath the iteration.
+   */
+  private static BufferChunkList concatRanges(BufferChunkList first,
+                                              BufferChunkList second) {
+    List<BufferChunk> chunks = new ArrayList<>();
+    for (BufferChunk list = first.get(); list != null; ) {
+      BufferChunk next = (BufferChunk) list.next;
+      chunks.add(list);
+      list = next;
+    }
+    for (BufferChunk list = second.get(); list != null; ) {
+      BufferChunk next = (BufferChunk) list.next;
+      chunks.add(list);
+      list = next;
+    }
+    BufferChunkList result = new BufferChunkList();
+    for (BufferChunk chunk : chunks) {
+      result.add(chunk);
+    }
+    return result;
+  }
+
+  /**
+   * Parse the row index out of the chunks the single combined read already
+   * filled. This is the same work StripePlanner.readRowIndex does after its own
+   * readFileData; the only reason the test does it here is that re-entering
+   * readRowIndex would re-plan and issue a redundant second read, which would
+   * defeat the measurement.
+   */
+  private static OrcIndex parseCoReadIndexes(StripePlanner planner, int typeCount)
+      throws IOException {
+    OrcProto.RowIndex[] indexes = new OrcProto.RowIndex[typeCount];
+    OrcProto.Stream.Kind[] bloomFilterKinds = new OrcProto.Stream.Kind[typeCount];
+    OrcProto.BloomFilterIndex[] blooms = new OrcProto.BloomFilterIndex[typeCount];
+    for (int column = 0; column < typeCount; ++column) {
+      InStream in = planner.getStream(
+          new StreamName(column, OrcProto.Stream.Kind.ROW_INDEX));
+      if (in != null) {
+        indexes[column] = OrcProto.RowIndex.parseFrom(
+            InStream.createCodedInputStream(in));
+      }
+    }
+    return new OrcIndex(indexes, bloomFilterKinds, blooms);
+  }
+
+  private static long totalLength(BufferChunkList list) {
+    long result = 0;
+    for (BufferChunk chunk = list.get(); chunk != null;
+        chunk = (BufferChunk) chunk.next) {
+      result += chunk.getLength();
+    }
+    return result;
+  }
+
+  private static int countChunks(BufferChunkList list) {
+    int result = 0;
+    for (BufferChunk chunk = list.get(); chunk != null;
+        chunk = (BufferChunk) chunk.next) {
+      result += 1;
+    }
+    return result;
+  }
+
+  /**
+   * Test-only decorator that records how many readFileData calls were made and
+   * how many bytes they moved, then delegates to the MockDataReader.
+   */
+  private static class CountingDataReader implements DataReader {
+    private final MockDataReader delegate;
+    int readCalls = 0;
+    int chunksRead = 0;
+    long bytesRead = 0;
+
+    CountingDataReader(MockDataReader delegate) {
+      this.delegate = delegate;
+    }
+
+    @Override
+    public void open() throws IOException {
+      delegate.open();
+    }
+
+    @Override
+    public OrcProto.StripeFooter readStripeFooter(StripeInformation stripe)
+        throws IOException {
+      return delegate.readStripeFooter(stripe);
+    }
+
+    @Override
+    public BufferChunkList readFileData(BufferChunkList list,
+                                        boolean doForceDirect) {
+      readCalls += 1;
+      for (BufferChunk chunk = list.get(); chunk != null;
+          chunk = (BufferChunk) chunk.next) {
+        // the delegate only fetches chunks that are not resident yet, so count
+        // exactly the ones it is about to pull off disk
+        if (!chunk.hasData()) {
+          chunksRead += 1;
+          bytesRead += chunk.getLength();
+        }
+      }
+      return delegate.readFileData(list, doForceDirect);
+    }
+
+    @Override
+    public boolean isTrackingDiskRanges() {
+      return delegate.isTrackingDiskRanges();
+    }
+
+    @Deprecated
+    @Override
+    public void releaseBuffer(ByteBuffer toRelease) {
+      delegate.releaseBuffer(toRelease);
+    }
+
+    @Override
+    public void releaseAllBuffers() {
+      delegate.releaseAllBuffers();
+    }
+
+    @Override
+    public DataReader clone() {
+      throw new UnsupportedOperationException("Clone not supported.");
+    }
+
+    @Override
+    public void close() throws IOException {
+      delegate.close();
+    }
+
+    @Override
+    public InStream.StreamOptions getCompressionOptions() {
+      return delegate.getCompressionOptions();
+    }
+  }
+
+  /**
+   * PROTOTYPE: one combined readFileData over the index chunks plus the full
+   * data chunks of a tiny stripe, versus the normal phased index-then-partial-
+   * data reads.
+   */
+  @Test
+  public void testCombinedIndexDataCoRead() throws Exception {
+    TypeDescription schema = TypeDescription.fromString("struct<x:int,y:int>");
+    // indexed by column id: 0 = struct, 1 = x, 2 = y
+    boolean[] columns = new boolean[]{true, true, true};
+    int typeCount = schema.getMaximumId() + 1;
+
+    // ---- baseline: exactly what production does today ----
+    MockDataReader phasedMock = createCoReadFixture(schema);
+    MockStripe phasedStripe = phasedMock.getStripe(0);
+    CountingDataReader phased = new CountingDataReader(phasedMock);
+    StripePlanner phasedPlanner =
+        new StripePlanner(schema, new ReaderEncryption(), phased,
+            OrcFile.WriterVersion.ORC_14, false, Integer.MAX_VALUE);
+    phasedPlanner.parseStripe(phasedStripe, columns);
+
+    // phase 1: the index
+    OrcIndex phasedIndex = phasedPlanner.readRowIndex(null, null);
+    boolean[] phasedRowGroups = pickCoReadRowGroups(schema, phasedStripe, phasedIndex);
+    // phase 2: only the data of the row groups the SARG kept
+    BufferChunkList phasedChunks = phasedPlanner.readData(phasedIndex, phasedRowGroups,
+        false, TypeReader.ReadPhase.ALL);
+
+    // the SARG keeps the first row group and drops the second one entirely
+    assertArrayEquals(new boolean[]{true, false}, phasedRowGroups);
+
+    // the phased path needs two round trips
+    assertEquals(2, phased.readCalls);
+    // index bytes, plus for each stream only up to the start of the dropped
+    // row group plus the uncompressed slop (RecordReaderUtils
+    // .estimateRgEndOffset); the PRESENT streams are shorter than that slop so
+    // they are read whole
+    long expectedPartialData = 1000
+        + Math.min(CO_READ_X_DATA, CO_READ_X_RG1 + RecordReaderUtils.WORST_UNCOMPRESSED_SLOP)
+        + 2000
+        + Math.min(CO_READ_Y_DATA, CO_READ_Y_RG1 + RecordReaderUtils.WORST_UNCOMPRESSED_SLOP);
+    assertEquals(4, countChunks(phasedChunks));
+    assertEquals(expectedPartialData, totalLength(phasedChunks));
+    assertEquals(phasedStripe.getIndexLength() + expectedPartialData, phased.bytesRead);
+
+    // ---- prototype: the same stripe read with ONE combined call ----
+    MockDataReader combinedMock = createCoReadFixture(schema);
+    MockStripe combinedStripe = combinedMock.getStripe(0);
+    CountingDataReader combined = new CountingDataReader(combinedMock);
+    StripePlanner combinedPlanner =
+        new StripePlanner(schema, new ReaderEncryption(), combined,
+            OrcFile.WriterVersion.ORC_14, false, Integer.MAX_VALUE);
+    combinedPlanner.parseStripe(combinedStripe, columns);
+
+    BufferChunkList indexRanges = planIndexRanges(combinedPlanner, null);
+    // the index is not in hand yet, so the co-read has to plan every data byte
+    BufferChunkList dataRanges =
+        planDataRanges(combinedPlanner, TypeReader.ReadPhase.ALL);
+    BufferChunkList combinedRanges = concatRanges(indexRanges, dataRanges);
+
+    assertEquals(6, countChunks(combinedRanges));
+    // the index chunks sit immediately before the data chunks in the file, so
+    // the combined list collapses to one contiguous span -- this is the only
+    // thing the single call actually buys
+    long spanStart = combinedRanges.get().getOffset();
+    long expectedEnd = spanStart;
+    for (BufferChunk chunk = combinedRanges.get(); chunk != null;
+        chunk = (BufferChunk) chunk.next) {
+      assertEquals(expectedEnd, chunk.getOffset(),
+          "combined ranges must stay contiguous so they coalesce");
+      expectedEnd += chunk.getLength();
+    }
+    assertEquals(combinedStripe.getIndexLength() + combinedStripe.getDataLength(),
+        expectedEnd - spanStart);
+
+    // the one and only I/O call
+    combined.readFileData(combinedRanges, false);
+    assertEquals(1, combined.readCalls);
+    assertEquals(6, combined.chunksRead);
+    assertEquals(combinedStripe.getIndexLength() + combinedStripe.getDataLength(),
+        combined.bytesRead);
+
+    // the extra bytes are exactly the ones the phased path refused to fetch
+    assertTrue(combined.bytesRead > phased.bytesRead,
+        "co-read must read the skipped row group's data: "
+            + combined.bytesRead + " > " + phased.bytesRead);
+    assertEquals(combined.bytesRead - phased.bytesRead,
+        combinedStripe.getDataLength() - expectedPartialData);
+
+    // ---- the result must be unchanged ----
+    OrcIndex combinedIndex = parseCoReadIndexes(combinedPlanner, typeCount);
+    boolean[] combinedRowGroups = pickCoReadRowGroups(schema, combinedStripe, combinedIndex);
+
+    assertArrayEquals(phasedRowGroups, combinedRowGroups);
+    assertEquals(phasedIndex.getRowGroupIndex()[1],
+        combinedIndex.getRowGroupIndex()[1]);
+    assertEquals(phasedIndex.getRowGroupIndex()[2],
+        combinedIndex.getRowGroupIndex()[2]);
   }
 }

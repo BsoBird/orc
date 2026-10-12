@@ -112,7 +112,8 @@ public class RecordReaderUtils {
                                         boolean doForceDirect
                                         ) throws IOException {
       if (supportVectoredIO && zcr == null) {
-        RecordReaderUtils.readDiskRangesVectored(file, range, doForceDirect, minSeekSize);
+        RecordReaderUtils.readDiskRangesVectored(file, range, doForceDirect, minSeekSize,
+            minSeekSizeTolerance);
       } else {
         RecordReaderUtils.readDiskRanges(file, zcr, range, doForceDirect,
                                          minSeekSize, minSeekSizeTolerance);
@@ -626,9 +627,12 @@ public class RecordReaderUtils {
    * </ul>
    * With {@code minSeekSize == 0} the behaviour is identical to the no-gap
    * variant (touching/overlap merge only). The vectored path bounds over-read
-   * by {@code minSeekSize} alone; it does not additionally apply
-   * {@code minSeekSizeTolerance} (the tolerance is only applied by the sync
-   * path's {@code ChunkReader}).
+   * by {@code minSeekSize} alone; the on-disk read is never enlarged by the
+   * {@code minSeekSizeTolerance} parameter. The tolerance is applied
+   * <em>after</em> the read by {@link #readDiskRangesVectored} as a memory
+   * bound: each merged range that exceeds the tolerance is compacted into
+   * a tightly-sized buffer mirroring the sync-path
+   * {@code ChunkReader.populateChunksReduceSize} semantics.
    *
    * @param entries     ordered list of coalescing entries
    * @param minSeekSize non-negative tolerance (in bytes) for small gaps that
@@ -717,12 +721,15 @@ public class RecordReaderUtils {
    * regress on minSeekSize-bounded workloads (e.g. Hadoop's TestMinSeekSize
    * which expects ~106% reads with minSeekSize=1MB). The tolerance is
    * applied in {@code long} arithmetic; filled-chunk boundaries and the
-   * {@link #MAX_FILE_RANGE_LENGTH} cap remain hard limits. Note: the
-   * vectored path does NOT additionally apply
-   * {@code minSeekSizeTolerance} (that tolerance lives only on the sync
-   * path's {@code ChunkReader}); over-read in the vectored path is bounded
-   * by {@code minSeekSize} alone. With {@code minSeekSize == 0} the
-   * behaviour is exactly the Phase 1 gap==0 / overlap-only merge.
+   * {@link #MAX_FILE_RANGE_LENGTH} cap remain hard limits. The on-disk read
+   * is bounded by {@code minSeekSize} alone; the {@code minSeekSizeTolerance}
+   * parameter is applied as a post-read memory bound: for every merged
+   * range whose extra-bytes fraction (gap bytes / requested bytes) exceeds
+   * the tolerance, the backing buffer is compacted into a tightly-sized
+   * buffer that holds only the requested chunk bytes - mirroring the sync
+   * path's {@code ChunkReader.populateChunksReduceSize} semantics. With
+   * {@code minSeekSize == 0} the behaviour is exactly the Phase 1
+   * gap==0 / overlap-only merge.
    * <p>
    * The merged span is computed in {@code long} arithmetic; if growing the
    * in-flight range would push its length past
@@ -731,20 +738,31 @@ public class RecordReaderUtils {
    * that would otherwise produce a negative or truncated FileRange when caller
    * offsets approach or exceed {@link Integer#MAX_VALUE}.
    *
-   * @param fileInputStream the input stream to read from
-   * @param range           the ordered list of disk ranges within the file to
-   *                        read
-   * @param doForceDirect   allocate direct buffers
-   * @param minSeekSize     non-negative minimum gap (in bytes) that is still
-   *                        merged into a single FileRange. {@code 0}
-   *                        disables the bounded gap merge and restores the
-   *                        Phase 1 behaviour exactly.
+   * @param fileInputStream       the input stream to read from
+   * @param range                 the ordered list of disk ranges within the
+   *                              file to read
+   * @param doForceDirect         allocate direct buffers
+   * @param minSeekSize           non-negative minimum gap (in bytes) that is
+   *                              still merged into a single FileRange.
+   *                              {@code 0} disables the bounded gap merge
+   *                              and restores the Phase 1 behaviour exactly.
+   * @param minSeekSizeTolerance  non-negative extra-bytes fraction above
+   *                              which a merged range's buffer is compacted
+   *                              to exactly the requested chunk bytes. The
+   *                              compaction is a post-read memory bound only;
+   *                              it does NOT change how many bytes are read
+   *                              from disk (the read is bounded by
+   *                              {@code minSeekSize}). Mirrors the sync
+   *                              path's {@code ChunkReader.populateChunks}
+   *                              semantics so a vectored reader pays no
+   *                              extra memory for small-gap merges.
    */
   private static void readDiskRangesVectored(
       FSDataInputStream fileInputStream,
       BufferChunkList range,
       boolean doForceDirect,
-      int minSeekSize) throws IOException {
+      int minSeekSize,
+      double minSeekSizeTolerance) throws IOException {
     if (range == null) return;
 
     IntFunction<ByteBuffer> allocate =
@@ -803,7 +821,13 @@ public class RecordReaderUtils {
     // BufferChunks are visited in their original sorted order; fileRanges is
     // also strictly increasing in offset. We use a single forward-moving
     // pointer so the total backfill cost is O(chunks + ranges) instead of
-    // O(chunks * ranges).
+    // O(chunks * ranges). We also remember which BufferChunks each FileRange
+    // owns (in chunk order) so the post-slicing compaction pass can decide
+    // per-range whether to drop the over-read bytes from memory.
+    List<List<BufferChunk>> chunksByRange = new java.util.ArrayList<>(fileRanges.size());
+    for (int i = 0; i < fileRanges.size(); i++) {
+      chunksByRange.add(new java.util.ArrayList<>());
+    }
     BufferChunk cur = range.get();
     int rangeIdx = 0;
     while (cur != null) {
@@ -826,11 +850,13 @@ public class RecordReaderUtils {
         // forward, so the total work across all chunks stays O(chunks +
         // ranges).
         FileRange owner = null;
+        int ownerIdx = -1;
         while (rangeIdx < fileRanges.size() &&
             fileRanges.get(rangeIdx).getOffset() <= chunkOffset) {
           FileRange candidate = fileRanges.get(rangeIdx);
           if ((long) candidate.getOffset() + candidate.getLength() >= chunkEnd) {
             owner = candidate;
+            ownerIdx = rangeIdx;
             break;
           }
           rangeIdx++;
@@ -857,11 +883,79 @@ public class RecordReaderUtils {
           // Hand the consumer a chunk-sized view starting at 0.
           slice = slice.slice();
           cur.setChunk(slice);
+          chunksByRange.get(ownerIdx).add(cur);
         } catch (InterruptedException | ExecutionException e) {
           throw new RuntimeException(e);
         }
       }
       cur = (BufferChunk) cur.next;
+    }
+
+    // Post-read memory compaction. For each merged FileRange, compute the
+    // extra-bytes fraction as (rangeLength - reqBytes) / reqBytes. If the
+    // fraction exceeds minSeekSizeTolerance, the over-read gap bytes are
+    // dropped from memory by allocating a tightly-sized buffer and copying
+    // the requested chunk bytes contiguously in chunk order; each owning
+    // BufferChunk is then handed a slice of that compacted buffer. This
+    // mirrors the sync path's ChunkReader.populateChunksReduceSize
+    // semantics so a vectored reader pays no extra memory for small-gap
+    // merges. Ranges with reqBytes == 0 cannot be compacted; ranges that
+    // own exactly one chunk have no gap bytes and are skipped cheaply.
+    for (int i = 0; i < fileRanges.size(); i++) {
+      FileRange range_i = fileRanges.get(i);
+      List<BufferChunk> owned = chunksByRange.get(i);
+      if (owned.size() <= 1) {
+        continue;
+      }
+      long reqBytesL = 0L;
+      for (BufferChunk c : owned) {
+        reqBytesL += c.getLength();
+      }
+      if (reqBytesL <= 0L) {
+        continue;
+      }
+      long rangeLength = range_i.getLength();
+      long extraBytesFractionNum = rangeLength - reqBytesL;
+      if (extraBytesFractionNum <= 0L) {
+        continue;
+      }
+      double extraBytesFraction = extraBytesFractionNum / (double) reqBytesL;
+      if (extraBytesFraction <= minSeekSizeTolerance) {
+        continue;
+      }
+      int reqBytes = (int) reqBytesL;
+      ByteBuffer compacted;
+      if (doForceDirect) {
+        compacted = ByteBuffer.allocateDirect(reqBytes);
+      } else {
+        compacted = ByteBuffer.allocate(reqBytes);
+      }
+      for (BufferChunk c : owned) {
+        // Copy exactly c.getLength() bytes from the chunk's existing slice
+        // (which currently points into the full range buffer) into the next
+        // position in the compacted buffer.
+        ByteBuffer src = c.getData();
+        int copyLen = c.getLength();
+        compacted.put(src.duplicate().position(0).limit(copyLen));
+      }
+      compacted.flip();
+      // Re-slice each BufferChunk to its window in the compacted buffer.
+      int copyStart = 0;
+      for (BufferChunk c : owned) {
+        int copyLen = c.getLength();
+        ByteBuffer slice = compacted.duplicate();
+        slice.position(copyStart);
+        slice.limit(copyStart + copyLen);
+        c.setChunk(slice.slice());
+        copyStart += copyLen;
+        assert copyStart <= reqBytes;
+      }
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Vectored compaction: range [{}, {}), reqBytes={}, extraFraction={}, "
+                + "tolerance={}", range_i.getOffset(),
+            range_i.getOffset() + rangeLength, reqBytes, extraBytesFraction,
+            minSeekSizeTolerance);
+      }
     }
   }
 

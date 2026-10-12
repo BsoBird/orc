@@ -293,7 +293,7 @@ class TestRecordReaderUtils {
                                                    BufferChunkList ranges,
                                                    boolean doForceDirect)
       throws Exception {
-    invokeReadDiskRangesVectored(in, ranges, doForceDirect, 0);
+    invokeReadDiskRangesVectored(in, ranges, doForceDirect, 0, 0.0);
   }
 
   private static void invokeReadDiskRangesVectored(FSDataInputStream in,
@@ -301,11 +301,20 @@ class TestRecordReaderUtils {
                                                    boolean doForceDirect,
                                                    int minSeekSize)
       throws Exception {
+    invokeReadDiskRangesVectored(in, ranges, doForceDirect, minSeekSize, 0.0);
+  }
+
+  private static void invokeReadDiskRangesVectored(FSDataInputStream in,
+                                                   BufferChunkList ranges,
+                                                   boolean doForceDirect,
+                                                   int minSeekSize,
+                                                   double minSeekSizeTolerance)
+      throws Exception {
     Method m = RecordReaderUtils.class.getDeclaredMethod(
         "readDiskRangesVectored", FSDataInputStream.class, BufferChunkList.class,
-        boolean.class, int.class);
+        boolean.class, int.class, double.class);
     m.setAccessible(true);
-    m.invoke(null, in, ranges, doForceDirect, minSeekSize);
+    m.invoke(null, in, ranges, doForceDirect, minSeekSize, minSeekSizeTolerance);
   }
 
   private static byte[] makePatternArray(int size, long baseOffset) {
@@ -606,7 +615,7 @@ class TestRecordReaderUtils {
     List<FileRange> out = RecordReaderUtils.coalesceRanges(
         entries(in, new boolean[]{false, false}));
     assertEquals(1, out.size(),
-        "Merged span equal to MAX_ARRAY_SIZE must stay in a single FileRange");
+        "Merged span equal to IOUtils.MAX_ARRAY_SIZE must stay in a single FileRange");
     assertEquals(0L, out.get(0).getOffset());
     assertEquals(max, out.get(0).getLength());
     assertArrayEquals(new long[][]{{0L, max}}, fileRangesAsPairs(out));
@@ -632,7 +641,7 @@ class TestRecordReaderUtils {
     List<FileRange> out = RecordReaderUtils.coalesceRanges(
         entries(in, new boolean[]{false, false, false}));
     assertEquals(2, out.size(),
-        "Span exceeding MAX_ARRAY_SIZE must split into multiple FileRanges");
+        "Span exceeding IOUtils.MAX_ARRAY_SIZE must split into multiple FileRanges");
     long[][] expected = new long[][]{
         {0L, maxL - 100L},
         {maxL - 100L, maxL}};
@@ -961,7 +970,7 @@ class TestRecordReaderUtils {
         IllegalArgumentException.class,
         () -> RecordReaderUtils.coalesceRanges(
             entries(in, new boolean[]{false})),
-        "A single CoalesceEntry longer than MAX_ARRAY_SIZE must be rejected");
+        "A single CoalesceEntry longer than IOUtils.MAX_ARRAY_SIZE must be rejected");
     assertTrue(ex.getMessage().contains(String.valueOf(overCap)),
         "Exception message must surface the offending length: " + ex.getMessage());
   }
@@ -1412,5 +1421,231 @@ class TestRecordReaderUtils {
         "Negative minSeekSize must be rejected");
     assertTrue(ex.getMessage().contains("minSeekSize"),
         "Exception message must mention minSeekSize: " + ex.getMessage());
+  }
+
+  // ---------------------------------------------------------------------
+  // Vectored read path: minSeekSizeTolerance memory compaction parity
+  // with the sync path's ChunkReader.populateChunksReduceSize semantics.
+  //
+  // The vectored path coalesces pending BufferChunks into one or more
+  // FileRanges (with bounded small-gap merge via minSeekSize). When the
+  // gap bytes included in a merged range push the extra-bytes fraction
+  // (gap / reqBytes) above minSeekSizeTolerance, the over-read bytes must
+  // be dropped from memory by allocating a tightly-sized buffer and
+  // copying only the requested chunk bytes contiguously in chunk order.
+  // ---------------------------------------------------------------------
+
+  /**
+   * When a small-gap merge produces a single FileRange whose extra-bytes
+   * fraction exceeds {@code minSeekSizeTolerance}, the vectored path must
+   * compact the merged buffer to exactly the requested chunk bytes. The
+   * sync-path short-circuit fires (gap-merged batch coalesces to one
+   * FileRange, so readVectored is NOT invoked) and the over-read must be
+   * dropped from memory. Chunk contents must remain correct.
+   */
+  @Test
+  public void testVectoredGapMergedAndCompactedWhenToleranceExceeded()
+      throws Exception {
+    byte[] backing = makePatternArray(4096, 0);
+    MockDFSDataInputStream dis = newBackingStream(backing);
+    FSDataInputStream in = new FSDataInputStream(dis);
+
+    int minSeekSize = 100;
+    // First chunk ends at 100, second starts at 200 -> gap = 100 == minSeekSize.
+    // reqBytes = 100 + 100 = 200, rangeLength = 300, fraction = 100/200 = 0.5.
+    // With tolerance = 0.0 the fraction (0.5) > 0.0 so compaction must fire.
+    BufferChunkList ranges = new TestOrcLargeStripe.RangeBuilder()
+        .range(0, 100)          // [0, 100)
+        .range(200, 100).build(); // [200, 300) - gap of 100 = minSeekSize
+
+    invokeReadDiskRangesVectored(in, ranges, false, minSeekSize, 0.0);
+
+    // Sync short-circuit: readVectored must NOT be invoked.
+    assertEquals(0, dis.getVectoredCallCount(),
+        "Gap-merged batch must NOT invoke readVectored");
+    assertEquals(1, dis.getReadFullyCallCount(),
+        "Gap-merged single range must invoke readFully exactly once");
+
+    // Chunk contents must remain correct after compaction.
+    assertArrayEquals(
+        Arrays.copyOfRange(backing, 0, 100),
+        byteBufferToArray(ranges.get(0).getData()),
+        "First chunk contents must be preserved across compaction");
+    assertArrayEquals(
+        Arrays.copyOfRange(backing, 200, 300),
+        byteBufferToArray(ranges.get(1).getData()),
+        "Second chunk contents must be preserved across compaction");
+
+    // The compacted buffer holds exactly the requested chunk bytes (200 B),
+    // not the 300-byte over-read range. Verify the chunk's backing buffer
+    // capacity is bounded to 200, and that the two chunk slices are
+    // contiguous views of a single 200-byte backing array.
+    ByteBuffer c0 = ranges.get(0).getData();
+    ByteBuffer c1 = ranges.get(1).getData();
+    assertEquals(100, c0.capacity(),
+        "Compacted chunk 0 capacity must equal its length, not the range length");
+    assertEquals(100, c1.capacity(),
+        "Compacted chunk 1 capacity must equal its length, not the range length");
+    assertEquals(0, c0.position(),
+        "Compacted chunk 0 must start at position 0");
+    assertEquals(0, c1.position(),
+        "Compacted chunk 1 must start at position 0");
+    assertEquals(100, c0.remaining(),
+        "Compacted chunk 0 must have remaining() == 100");
+    assertEquals(100, c1.remaining(),
+        "Compacted chunk 1 must have remaining() == 100");
+    // The two slices must be backed by the same underlying array; that
+    // array's length must be exactly reqBytes = 200, not the range's 300.
+    assertEquals(c0.array(), c1.array(),
+        "Compacted chunks must share a single backing array");
+    assertEquals(200, c0.array().length,
+        "Compacted backing array length must equal reqBytes (200), not the range length (300)");
+  }
+
+  /**
+   * When the extra-bytes fraction is within the tolerance, the merged
+   * range buffer is kept as-is: chunks remain slices of the over-read
+   * range buffer (no compaction).
+   */
+  @Test
+  public void testVectoredGapMergedButNotCompactedWithinTolerance()
+      throws Exception {
+    byte[] backing = makePatternArray(4096, 0);
+    MockDFSDataInputStream dis = newBackingStream(backing);
+    FSDataInputStream in = new FSDataInputStream(dis);
+
+    int minSeekSize = 100;
+    // Same layout as the compaction test: reqBytes = 200, rangeLength = 300,
+    // fraction = 0.5. With tolerance = 1.0 the fraction (0.5) <= 1.0 so
+    // compaction must NOT fire; chunk slices must still point into the
+    // 300-byte range buffer.
+    BufferChunkList ranges = new TestOrcLargeStripe.RangeBuilder()
+        .range(0, 100)
+        .range(200, 100).build();
+
+    invokeReadDiskRangesVectored(in, ranges, false, minSeekSize, 1.0);
+
+    // Sync short-circuit (single coalesced range).
+    assertEquals(0, dis.getVectoredCallCount(),
+        "Gap-merged batch must NOT invoke readVectored");
+    assertEquals(1, dis.getReadFullyCallCount(),
+        "Gap-merged single range must invoke readFully exactly once");
+
+    // Chunk contents must still be correct.
+    assertArrayEquals(
+        Arrays.copyOfRange(backing, 0, 100),
+        byteBufferToArray(ranges.get(0).getData()));
+    assertArrayEquals(
+        Arrays.copyOfRange(backing, 200, 300),
+        byteBufferToArray(ranges.get(1).getData()));
+
+    // The two slices must NOT be backed by a 200-byte compacted array;
+    // they must remain slices of the 300-byte range buffer.
+    ByteBuffer c0 = ranges.get(0).getData();
+    ByteBuffer c1 = ranges.get(1).getData();
+    assertEquals(100, c0.capacity(),
+        "Non-compacted chunk 0 capacity must equal its length");
+    assertEquals(100, c1.capacity(),
+        "Non-compacted chunk 1 capacity must equal its length");
+    assertEquals(c0.array(), c1.array(),
+        "Non-compacted chunks must share the range backing array");
+    assertEquals(300, c0.array().length,
+        "Non-compacted backing array must be the full 300-byte range buffer, not compacted to 200");
+  }
+
+  /**
+   * The compaction pass also applies on the single-range short-circuit
+   * path. A coalesced single range with an internal gap (e.g. two chunks
+   * merging into one range because the gap is within minSeekSize) must
+   * still have its over-read dropped when the fraction exceeds tolerance.
+   * readVectored is NOT invoked (the batch coalesces to one range); the
+   * sync readFully path runs, then the post-read compaction pass trims
+   * the over-read from memory.
+   */
+  @Test
+  public void testVectoredSingleRangeShortCircuitIsAlsoCompacted()
+      throws Exception {
+    byte[] backing = makePatternArray(4096, 0);
+    MockDFSDataInputStream dis = newBackingStream(backing);
+    FSDataInputStream in = new FSDataInputStream(dis);
+
+    int minSeekSize = 100;
+    // Two chunks with a 100-byte gap that minSeekSize covers; batch
+    // coalesces to one FileRange, sync short-circuit fires. With
+    // tolerance = 0.0 the compaction must still fire on the single-range
+    // path because (300 - 200) / 200 = 0.5 > 0.0.
+    BufferChunkList ranges = new TestOrcLargeStripe.RangeBuilder()
+        .range(100, 100)         // [100, 200)
+        .range(300, 100).build(); // [300, 400) - gap of 100 = minSeekSize
+
+    invokeReadDiskRangesVectored(in, ranges, false, minSeekSize, 0.0);
+
+    assertEquals(0, dis.getVectoredCallCount(),
+        "Single-range short-circuit must NOT invoke readVectored");
+    assertEquals(1, dis.getReadFullyCallCount(),
+        "Single-range short-circuit must invoke readFully exactly once");
+
+    // Contents must be correct.
+    assertArrayEquals(
+        Arrays.copyOfRange(backing, 100, 200),
+        byteBufferToArray(ranges.get(0).getData()));
+    assertArrayEquals(
+        Arrays.copyOfRange(backing, 300, 400),
+        byteBufferToArray(ranges.get(1).getData()));
+
+    // Backing array must be the 200-byte compacted buffer, not the
+    // 300-byte range buffer read off disk.
+    ByteBuffer c0 = ranges.get(0).getData();
+    ByteBuffer c1 = ranges.get(1).getData();
+    assertEquals(c0.array(), c1.array(),
+        "Compacted chunks must share a single backing array");
+    assertEquals(200, c0.array().length,
+        "Single-range short-circuit backing array must be compacted to reqBytes (200), "
+            + "not the 300-byte over-read range");
+  }
+
+  /**
+   * Regression guard: existing minSeekSize=0 default (Phase 1) behaviour
+   * must not change. Two adjacent chunks coalesce to a single range with
+   * no over-read (reqBytes == rangeLength), so the extra-bytes fraction
+   * is 0, which is <= any non-negative tolerance - compaction is a no-op
+   * and chunk slices remain the original 200-byte range buffer.
+   */
+  @Test
+  public void testVectoredToleranceCompactionNoOpOnContiguousMerge()
+      throws Exception {
+    byte[] backing = makePatternArray(4096, 0);
+    MockDFSDataInputStream dis = newBackingStream(backing);
+    FSDataInputStream in = new FSDataInputStream(dis);
+
+    // minSeekSize = 0 (default), tolerance = 0.0; adjacent chunks touch,
+    // reqBytes = rangeLength = 200, so fraction = 0 <= 0.0 and no
+    // compaction should fire.
+    BufferChunkList ranges = new TestOrcLargeStripe.RangeBuilder()
+        .range(100, 100)
+        .range(200, 100).build();
+
+    invokeReadDiskRangesVectored(in, ranges, false, 0, 0.0);
+
+    assertEquals(0, dis.getVectoredCallCount(),
+        "Single-range batch must NOT invoke readVectored");
+    assertEquals(1, dis.getReadFullyCallCount(),
+        "Single-range batch must invoke readFully exactly once");
+
+    assertArrayEquals(
+        Arrays.copyOfRange(backing, 100, 200),
+        byteBufferToArray(ranges.get(0).getData()));
+    assertArrayEquals(
+        Arrays.copyOfRange(backing, 200, 300),
+        byteBufferToArray(ranges.get(1).getData()));
+
+    // reqBytes == rangeLength so no compaction; backing array is the
+    // 200-byte range buffer.
+    ByteBuffer c0 = ranges.get(0).getData();
+    ByteBuffer c1 = ranges.get(1).getData();
+    assertEquals(c0.array(), c1.array(),
+        "Contiguous-merge chunks must share a single backing array");
+    assertEquals(200, c0.array().length,
+        "Contiguous-merge backing array must remain the 200-byte range buffer");
   }
 }
