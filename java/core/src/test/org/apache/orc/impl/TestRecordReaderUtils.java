@@ -20,6 +20,7 @@ package org.apache.orc.impl;
 
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileRange;
+import org.apache.orc.OrcProto;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 
@@ -1647,5 +1648,25 @@ class TestRecordReaderUtils {
         "Contiguous-merge chunks must share a single backing array");
     assertEquals(200, c0.array().length,
         "Contiguous-merge backing array must remain the 200-byte range buffer");
+  }
+
+  @Test
+  public void testParseStripeFooter() throws IOException {
+    OrcProto.StripeFooter footer = OrcProto.StripeFooter.newBuilder()
+        .addStreams(OrcProto.Stream.newBuilder()
+            .setKind(OrcProto.Stream.Kind.DATA)
+            .setColumn(1)
+            .setLength(1024))
+        .setWriterTimezone("GMT")
+        .build();
+    byte[] serialized = footer.toByteArray();
+    // the buffer holds more room than the footer needs, so only the bytes
+    // between the position and the limit may be parsed
+    ByteBuffer tail = ByteBuffer.allocate(serialized.length + 128);
+    tail.put(serialized);
+    tail.flip();
+
+    assertEquals(footer, RecordReaderUtils.parseStripeFooter(tail,
+        new InStream.StreamOptions()));
   }
 }

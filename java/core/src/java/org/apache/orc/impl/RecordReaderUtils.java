@@ -102,9 +102,7 @@ public class RecordReaderUtils {
       // read the footer
       ByteBuffer tailBuf = ByteBuffer.allocate(tailLength);
       file.readFully(offset, tailBuf.array(), tailBuf.arrayOffset(), tailLength);
-      return OrcProto.StripeFooter.parseFrom(
-          InStream.createCodedInputStream(InStream.create("footer",
-              new BufferChunk(tailBuf, 0), 0, tailLength, options)));
+      return parseStripeFooter(tailBuf, options);
     }
 
     @Override
@@ -186,6 +184,24 @@ public class RecordReaderUtils {
 
   public static DataReader createDefaultDataReader(DataReaderProperties properties) {
     return new DefaultDataReader(properties);
+  }
+
+  /**
+   * Parse the stripe footer that is held in the given buffer. The buffer holds
+   * the bytes from its current position to its limit.
+   *
+   * @param tailBuf the buffer that holds the serialized stripe footer
+   * @param options the compression options of the file
+   * @return the parsed stripe footer
+   * @throws IOException if the footer can not be read from the buffer
+   */
+  public static OrcProto.StripeFooter parseStripeFooter(ByteBuffer tailBuf,
+                                                        InStream.StreamOptions options)
+      throws IOException {
+    int tailLength = tailBuf.remaining();
+    return OrcProto.StripeFooter.parseFrom(
+        InStream.createCodedInputStream(InStream.create("footer",
+            new BufferChunk(tailBuf, 0), 0, tailLength, options)));
   }
 
   /**
