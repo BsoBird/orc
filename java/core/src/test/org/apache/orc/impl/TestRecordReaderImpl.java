@@ -68,7 +68,6 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
 import java.nio.charset.StandardCharsets;
@@ -3043,21 +3042,13 @@ public class TestRecordReaderImpl {
   }
 
   private static BufferChunkList planIndexRanges(StripePlanner planner,
-                                                 boolean[] bloomFilterColumns)
-      throws Exception {
-    Method method = StripePlanner.class
-        .getDeclaredMethod("planIndexReading", boolean[].class);
-    method.setAccessible(true);
-    return (BufferChunkList) method.invoke(planner, (Object) bloomFilterColumns);
+                                                 boolean[] bloomFilterColumns) {
+    return planner.planIndexReading(bloomFilterColumns);
   }
 
   private static BufferChunkList planDataRanges(StripePlanner planner,
-                                                TypeReader.ReadPhase readPhase)
-      throws Exception {
-    Method method = StripePlanner.class
-        .getDeclaredMethod("planDataReading", TypeReader.ReadPhase.class);
-    method.setAccessible(true);
-    return (BufferChunkList) method.invoke(planner, readPhase);
+                                                TypeReader.ReadPhase readPhase) {
+    return planner.planDataReading(readPhase);
   }
 
   /**

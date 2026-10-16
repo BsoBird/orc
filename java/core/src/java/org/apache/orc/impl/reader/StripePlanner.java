@@ -449,7 +449,7 @@ public class StripePlanner {
    *                    we need bloom filters for
    * @return a list of merged disk ranges to read
    */
-  private BufferChunkList planIndexReading(boolean[] bloomFilterColumns) {
+  public BufferChunkList planIndexReading(boolean[] bloomFilterColumns) {
     BufferChunkList result = new BufferChunkList();
     for(StreamInformation stream: indexStreams) {
       switch (stream.kind) {
@@ -478,7 +478,7 @@ public class StripePlanner {
    * @param readPhase Determines the columns that will be planned.
    * @return a list of merged disk ranges to read
    */
-  private BufferChunkList planDataReading(TypeReader.ReadPhase readPhase) {
+  public BufferChunkList planDataReading(TypeReader.ReadPhase readPhase) {
     BufferChunkList result = new BufferChunkList();
     for(StreamInformation stream: dataStreams) {
       if (readPhase == TypeReader.ReadPhase.ALL ||
@@ -529,7 +529,7 @@ public class StripePlanner {
    * @param readPhase          Determines the columns that will be planned.
    * @return the list of disk  ranges that will be loaded
    */
-  private BufferChunkList planPartialDataReading(OrcIndex index,
+  public BufferChunkList planPartialDataReading(OrcIndex index,
                                                  @NotNull boolean[] includedRowGroups,
                                                  TypeReader.ReadPhase readPhase) {
     return planPartialDataReading(index, includedRowGroups, 0, readPhase);
@@ -543,7 +543,7 @@ public class StripePlanner {
    * @param includedRowGroups  which row groups are needed
    * @return the list of disk  ranges that will be loaded
    */
-  private BufferChunkList planPartialDataReading(OrcIndex index,
+  public BufferChunkList planPartialDataReading(OrcIndex index,
                                                  @NotNull boolean[] includedRowGroups,
                                                  int startGroup,
                                                  TypeReader.ReadPhase readPhase) {
