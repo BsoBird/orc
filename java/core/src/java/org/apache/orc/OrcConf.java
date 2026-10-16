@@ -186,6 +186,12 @@ public enum OrcConf {
       "in schema evolution is case sensitive .\n"),
   ALLOW_SARG_TO_FILTER("orc.sarg.to.filter", "orc.sarg.to.filter", false,
                        "A boolean flag to determine if a SArg is allowed to become a filter"),
+  SARG_STRIPE_PRUNING_ENABLED("orc.sarg.stripe.pruning.enabled",
+      "orc.sarg.stripe.pruning.enabled", false,
+      "A boolean flag to determine if the reader uses the stripe statistics that are\n" +
+      "stored in the file tail to skip whole stripes which can not contain rows that\n" +
+      "match the search argument. Only the unencrypted variant's statistics are used,\n" +
+      "so stripes which hold statistics for encrypted columns are never skipped."),
   READER_USE_SELECTED("orc.filter.use.selected", "orc.filter.use.selected", false,
                         "A boolean flag to determine if the selected vector is supported by\n"
                         + "the reading application. If false, the output of the ORC reader "

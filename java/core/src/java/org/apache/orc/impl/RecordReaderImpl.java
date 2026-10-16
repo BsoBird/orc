@@ -44,6 +44,7 @@ import org.apache.orc.Reader;
 import org.apache.orc.RecordReader;
 import org.apache.orc.StringColumnStatistics;
 import org.apache.orc.StripeInformation;
+import org.apache.orc.StripeStatistics;
 import org.apache.orc.TimestampColumnStatistics;
 import org.apache.orc.TypeDescription;
 import org.apache.orc.filter.BatchFilter;
@@ -106,6 +107,8 @@ public class RecordReaderImpl implements RecordReader {
   private final SargApplier sargApp;
   // an array about which row groups aren't skipped
   private boolean[] includedRowGroups = null;
+  // an array about which stripes aren't skipped, null if all of them are read
+  private boolean[] includedStripes = null;
   private final DataReader dataReader;
   private final int maxDiskRangeChunkLimit;
   private final StripePlanner planner;
@@ -144,6 +147,16 @@ public class RecordReaderImpl implements RecordReader {
                                          columnName + " on " + evolution.getReaderBaseSchema(),
                                          e);
     }
+  }
+
+  private static int countSelected(boolean[] included) {
+    int count = 0;
+    for (boolean value: included) {
+      if (value) {
+        count += 1;
+      }
+    }
+    return count;
   }
 
   /**
@@ -260,6 +273,15 @@ public class RecordReaderImpl implements RecordReader {
       } else if (stripeStart < maxOffset) {
         this.stripes.add(stripe);
         rows += stripe.getNumberOfRows();
+      }
+    }
+    if (sargApp != null && OrcConf.SARG_STRIPE_PRUNING_ENABLED.getBoolean(fileReader.conf)) {
+      // the stripe statistics are part of the file tail, so this does no IO
+      includedStripes = sargApp.pickStripes(this.stripes,
+          fileReader.getVariantStripeStatistics(null));
+      if (includedStripes != null) {
+        LOG.debug("Stripe pruning selected {} of {} stripes", countSelected(includedStripes),
+            this.stripes.size());
       }
     }
     this.maxDiskRangeChunkLimit = OrcConf.ORC_MAX_DISK_RANGE_CHUNK_LIMIT.getInt(fileReader.conf);
@@ -677,6 +699,32 @@ public class RecordReaderImpl implements RecordReader {
         null, statsProto, writerUsedProlepticGregorian, true);
     ValueRange range = getValueRange(cs, predicate, useUTCTimestamp);
 
+    TruthValue answer = checkWriterVersion(range, predicate, writerVersion, type, cs);
+    if (answer != null) {
+      return answer;
+    }
+    return evaluatePredicateRange(predicate, range,
+        BloomFilterIO.deserialize(kind, encoding, writerVersion, type.getCategory(),
+            bloomFilter), useUTCTimestamp);
+  }
+
+  /**
+   * Check if the writer of the file wrote statistics that can not be compared
+   * with the given predicate.
+   *
+   * @param range the value range of the statistics
+   * @param predicate the leaf predicate we need to evaluate
+   * @param writerVersion the version of software that wrote the file
+   * @param type what is the kind of this column
+   * @param cs the statistics of the column
+   * @return the set of truth values for the predicate or null if the
+   *   predicate can be evaluated with the given range.
+   */
+  static TruthValue checkWriterVersion(ValueRange range,
+                                       PredicateLeaf predicate,
+                                       OrcFile.WriterVersion writerVersion,
+                                       TypeDescription type,
+                                       ColumnStatistics cs) {
     // files written before ORC-135 stores timestamp wrt to local timezone causing issues with PPD.
     // disable PPD for timestamp for all old files
     TypeDescription.Category category = type.getCategory();
@@ -709,9 +757,7 @@ public class RecordReaderImpl implements RecordReader {
         return dstas.hasNull() ? TruthValue.YES_NO_NULL : TruthValue.YES_NO;
       }
     }
-    return evaluatePredicateRange(predicate, range,
-        BloomFilterIO.deserialize(kind, encoding, writerVersion, type.getCategory(),
-            bloomFilter), useUTCTimestamp);
+    return null;
   }
 
   /**
@@ -1252,6 +1298,131 @@ public class RecordReaderImpl implements RecordReader {
     }
 
     /**
+     * Pick the stripes that may contain rows matching the search argument by
+     * evaluating it against the stripe statistics stored in the file tail.
+     * <p>
+     * The statistics are always the ones of the unencrypted variant, so this
+     * never skips a stripe which is filtered on a column whose statistics are
+     * held by an encrypted variant. Bloom filters are not used, because they
+     * are not stored per stripe.
+     *
+     * @param stripes the stripes of the file
+     * @param stripeStats the stripe statistics aligned with the stripe ids or
+     *                    null when the file does not provide any
+     * @return an array with a boolean for each stripe or null if all of the
+     * stripes must be read. The array has an entry for every stripe, so all of
+     * the stripes are excluded when none of its entries is true.
+     */
+    public boolean[] pickStripes(List<? extends StripeInformation> stripes,
+                                 List<StripeStatistics> stripeStats) {
+      if (stripes == null || stripes.isEmpty() || stripeStats == null ||
+          sargLeaves.isEmpty()) {
+        return READ_ALL_RGS;
+      }
+      boolean[] result = new boolean[stripes.size()];
+      TruthValue[] leafValues = new TruthValue[sargLeaves.size()];
+      TruthValue[] exceptionAnswer = new TruthValue[leafValues.length];
+      boolean hasSkipped = false;
+      for (int stripeIx = 0; stripeIx < result.length; ++stripeIx) {
+        StripeStatistics stats = getStripeStatistics(stripes.get(stripeIx), stripeStats);
+        for (int pred = 0; pred < leafValues.length; ++pred) {
+          int columnIx = filterColumns[pred];
+          if (columnIx == -1) {
+            // the column is a virtual column
+            leafValues[pred] = TruthValue.YES_NO_NULL;
+          } else if (exceptionAnswer[pred] != null) {
+            leafValues[pred] = exceptionAnswer[pred];
+          } else if (evolution == null || !evolution.isPPDSafeConversion(columnIx)) {
+            // schema evolution makes the statistics unreliable
+            leafValues[pred] = TruthValue.YES_NO_NULL;
+          } else {
+            ColumnStatistics colStats = getStripeColumnStatistics(stats, columnIx);
+            if (colStats == null) {
+              // the writer did not record usable statistics for this column,
+              // which is the case for old files and for encrypted columns
+              leafValues[pred] = TruthValue.YES_NO_NULL;
+            } else {
+              PredicateLeaf predicate = sargLeaves.get(pred);
+              try {
+                ValueRange range = getValueRange(colStats, predicate, useUTCTimestamp);
+                TruthValue answer = checkWriterVersion(range, predicate, writerVersion,
+                    evolution.getFileSchema().findSubtype(columnIx), colStats);
+                leafValues[pred] = answer != null ? answer
+                    : evaluatePredicateRange(predicate, range, null, useUTCTimestamp);
+              } catch (Exception e) {
+                if (e instanceof SargCastException) {
+                  LOG.info("Skipping ORC PPD - " + e.getMessage() + " on " + predicate);
+                } else {
+                  LOG.warn(e.getClass().getSimpleName() +
+                      " when evaluating predicate on stripe statistics." +
+                      " Skipping ORC PPD.", e);
+                }
+                exceptionAnswer[pred] = colStats.hasNull() ? TruthValue.YES_NO_NULL
+                    : TruthValue.YES_NO;
+                leafValues[pred] = exceptionAnswer[pred];
+              }
+            }
+            if (LOG.isTraceEnabled()) {
+              LOG.trace("Setting " + sargLeaves.get(pred) + " to " + leafValues[pred] +
+                  " for stripe " + stripeIx);
+            }
+          }
+        }
+        result[stripeIx] = sarg.evaluate(leafValues).isNeeded();
+        hasSkipped = hasSkipped || (!result[stripeIx]);
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Stripe " + stripes.get(stripeIx).getStripeId() + " is " +
+              (result[stripeIx] ? "" : "not ") + "included.");
+        }
+      }
+      // the result has one entry per stripe, so unlike pickRowGroups it can
+      // not use READ_NO_RGS: an array without any true entry means that all of
+      // the stripes were excluded.
+      return hasSkipped ? result : READ_ALL_RGS;
+    }
+
+    /**
+     * Find the stripe statistics of the given stripe or null if the file does
+     * not provide them.
+     */
+    private static StripeStatistics getStripeStatistics(
+        StripeInformation stripe, List<StripeStatistics> stripeStats) {
+      long stripeId = stripe.getStripeId();
+      if (stripeId < 0 || stripeId >= stripeStats.size()) {
+        return null;
+      }
+      return stripeStats.get((int) stripeId);
+    }
+
+    /**
+     * Convert the stripe statistics of the given column or return null if the
+     * file does not provide usable statistics for it.
+     */
+    private ColumnStatistics getStripeColumnStatistics(StripeStatistics stats,
+                                                      int columnIx) {
+      if (stats == null) {
+        return null;
+      }
+      OrcProto.ColumnStatistics proto;
+      try {
+        proto = stats.getColumn(columnIx);
+      } catch (IndexOutOfBoundsException e) {
+        LOG.debug("Stripe statistics do not include column " + columnIx);
+        return null;
+      }
+      // Writers that have no statistics for the column, including the writers
+      // of files whose encrypted columns are kept in an encrypted variant,
+      // leave the column empty or count no values at all. Those can not be
+      // used to skip a stripe, because an empty statistic would match every
+      // predicate as if the column had no rows at all.
+      if (proto == null || !proto.hasNumberOfValues() || proto.getNumberOfValues() == 0) {
+        return null;
+      }
+      return ColumnStatisticsImpl.deserialize(null, proto,
+          writerUsedProlepticGregorian, convertToProlepticGregorian);
+    }
+
+    /**
      * Get the count of exceptions for testing.
      * @return
      */
@@ -1295,6 +1466,12 @@ public class RecordReaderImpl implements RecordReader {
    * @throws IOException
    */
   private void readStripe() throws IOException {
+    if (includedStripes != null && !includedStripes[currentStripe]) {
+      // The stripe statistics proved that this stripe has no matching rows, so
+      // mark it as consumed without reading its footer, index or data.
+      skipStripe();
+      return;
+    }
     StripeInformation stripe = beginReadStripe();
     // Reuse the footer that beginReadStripe already read to avoid a
     // duplicate readStripeFooter call inside StripePlanner.parseStripe.
@@ -1319,6 +1496,20 @@ public class RecordReaderImpl implements RecordReader {
         seekToRowEntry(reader, (int) (rowInStripe / rowIndexStride), startReadPhase);
       }
     }
+  }
+
+  /**
+   * Mark the current stripe as consumed without reading any of its data.
+   */
+  private void skipStripe() {
+    rowCountInStripe = stripes.get(currentStripe).getNumberOfRows();
+    rowInStripe = rowCountInStripe;
+    followRowInStripe = 0;
+    rowBaseInStripe = 0;
+    for (int i = 0; i < currentStripe; ++i) {
+      rowBaseInStripe += stripes.get(i).getNumberOfRows();
+    }
+    includedRowGroups = null;
   }
 
   private StripeInformation beginReadStripe() throws IOException {
@@ -1661,7 +1852,13 @@ public class RecordReaderImpl implements RecordReader {
 
     // move to the right stripe
     int rightStripe = findStripe(rowNumber);
-    if (rightStripe != currentStripe) {
+    // an explicit seek needs the rows of the stripe, even when the stripe
+    // statistics said that it can not contain rows matching the search argument
+    boolean pruned = includedStripes != null && !includedStripes[rightStripe];
+    if (pruned) {
+      includedStripes[rightStripe] = true;
+    }
+    if (pruned || rightStripe != currentStripe) {
       currentStripe = rightStripe;
       readStripe();
     }
