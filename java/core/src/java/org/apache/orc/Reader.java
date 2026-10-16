@@ -20,6 +20,8 @@ package org.apache.orc;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.ql.io.sarg.SearchArgument;
+import org.apache.orc.impl.reader.StripePlanner;
+import org.apache.orc.impl.reader.StripePlannerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -240,6 +242,7 @@ public interface Reader extends Closeable {
     private double minSeekSizeTolerance = (double) OrcConf.ORC_MIN_DISK_SEEK_SIZE_TOLERANCE
         .getDefaultValue();
     private int rowBatchSize = (int) OrcConf.ROW_BATCH_SIZE.getDefaultValue();
+    private StripePlannerFactory stripePlannerFactory = null;
 
     /**
      * @since 1.1.0
@@ -711,6 +714,35 @@ public interface Reader extends Closeable {
     public Options rowBatchSize(int value) {
       this.rowBatchSize = value;
       return this;
+    }
+
+    /**
+     * Set the factory that creates the {@link StripePlanner} used to parse the
+     * stripes and to plan the index and data reads of the RecordReader.
+     * <p>
+     * This is an advanced seam for alternate read planning; the default of
+     * {@code null} keeps the standard planner, so it is safe to leave unset.
+     * The factory is consulted once per RecordReader and must not do I/O. It
+     * is shared by all the readers created from these options, so it should
+     * hold no per-reader state. See {@link StripePlannerFactory} for the
+     * contract that implementations of a {@link StripePlanner} subclass have
+     * to follow.
+     * @param value the new factory or null for the standard planner
+     * @return this
+     * @since 1.9.0
+     */
+    public Options stripePlannerFactory(StripePlannerFactory value) {
+      this.stripePlannerFactory = value;
+      return this;
+    }
+
+    /**
+     * Get the factory that creates the {@link StripePlanner}, if any.
+     * @return the factory or null to use the standard planner
+     * @since 1.9.0
+     */
+    public StripePlannerFactory getStripePlannerFactory() {
+      return stripePlannerFactory;
     }
   }
 
