@@ -51,6 +51,7 @@ import org.apache.orc.filter.BatchFilter;
 import org.apache.orc.impl.filter.FilterFactory;
 import org.apache.orc.impl.reader.ReaderEncryption;
 import org.apache.orc.impl.reader.StripePlanner;
+import org.apache.orc.impl.reader.StripePlannerFactory;
 import org.apache.orc.impl.reader.tree.BatchReader;
 import org.apache.orc.impl.reader.tree.TypeReader;
 import org.apache.orc.util.BloomFilter;
@@ -387,9 +388,22 @@ public class RecordReaderImpl implements RecordReader {
         new OrcProto.Stream.Kind[columns],
         new OrcProto.BloomFilterIndex[columns]);
 
-    planner = new StripePlanner(evolution.getFileSchema(), encryption,
-                                dataReader, writerVersion, ignoreNonUtf8BloomFilter,
-                                maxDiskRangeChunkLimit, filterColIds);
+    StripePlannerFactory plannerFactory = options.getStripePlannerFactory();
+    if (plannerFactory == null) {
+      planner = new StripePlanner(evolution.getFileSchema(), encryption,
+                                  dataReader, writerVersion, ignoreNonUtf8BloomFilter,
+                                  maxDiskRangeChunkLimit, filterColIds);
+    } else {
+      planner = plannerFactory.create(evolution.getFileSchema(), encryption,
+                                      dataReader, writerVersion, ignoreNonUtf8BloomFilter,
+                                      maxDiskRangeChunkLimit, filterColIds);
+      if (planner == null) {
+        // release the resources that were acquired above
+        dataReader.close();
+        throw new IllegalArgumentException("StripePlannerFactory " +
+            plannerFactory.getClass().getName() + " returned null");
+      }
+    }
 
     try {
       advanceToNextRow(reader, 0L, true);
