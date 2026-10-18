@@ -1278,6 +1278,48 @@ public class RecordReaderImpl implements RecordReader {
                                    List<OrcProto.ColumnEncoding> encodings,
                                    OrcProto.BloomFilterIndex[] bloomFilterIndices,
                                    boolean returnNone) throws IOException {
+      return pickRowGroups(stripe, indexes, bloomFilterKinds, encodings,
+          bloomFilterIndices, returnNone, null);
+    }
+
+    /**
+     * Pick the row groups that we need to load from the current stripe and
+     * record the truth value that every predicate leaf has for every row group.
+     * <p>
+     * This is the entry point of the tests, which compare the truth values
+     * found by binary searching the row group statistics against the ones found
+     * by evaluating every row group.
+     *
+     * @param truthValues a matrix with one row per row group and one column per
+     *                    predicate leaf, filled in by this method
+     * @return the row groups that must be read
+     */
+    boolean[] pickRowGroupTruthValues(StripeInformation stripe,
+                                      OrcProto.RowIndex[] indexes,
+                                      OrcProto.Stream.Kind[] bloomFilterKinds,
+                                      List<OrcProto.ColumnEncoding> encodings,
+                                      OrcProto.BloomFilterIndex[] bloomFilterIndices,
+                                      TruthValue[][] truthValues) throws IOException {
+      return pickRowGroups(stripe, indexes, bloomFilterKinds, encodings,
+          bloomFilterIndices, true, truthValues);
+    }
+
+    /**
+     * Pick the row groups that we need to load from the current stripe.
+     *
+     * @param truthValues when it is not null, it is filled in with the truth
+     *                    value that every predicate leaf has for every row group
+     * @return an array with a boolean for each row group or null if all of the
+     * row groups must be read.
+     * @throws IOException
+     */
+    private boolean[] pickRowGroups(StripeInformation stripe,
+                                    OrcProto.RowIndex[] indexes,
+                                    OrcProto.Stream.Kind[] bloomFilterKinds,
+                                    List<OrcProto.ColumnEncoding> encodings,
+                                    OrcProto.BloomFilterIndex[] bloomFilterIndices,
+                                    boolean returnNone,
+                                    TruthValue[][] truthValues) throws IOException {
       long rowsInStripe = stripe.getNumberOfRows();
       int groupsInStripe = (int) ((rowsInStripe + rowIndexStride - 1) / rowIndexStride);
       boolean[] result = new boolean[groupsInStripe]; // TODO: avoid alloc?
@@ -1285,6 +1327,7 @@ public class RecordReaderImpl implements RecordReader {
       boolean hasSelected = false;
       boolean hasSkipped = false;
       TruthValue[] exceptionAnswer = new TruthValue[leafValues.length];
+      RowGroupPruning[] prunings = buildRowGroupPrunings(indexes, groupsInStripe);
       for (int rowGroup = 0; rowGroup < result.length; ++rowGroup) {
         for (int pred = 0; pred < leafValues.length; ++pred) {
           int columnIx = filterColumns[pred];
@@ -1293,6 +1336,10 @@ public class RecordReaderImpl implements RecordReader {
             leafValues[pred] = TruthValue.YES_NO_NULL;
           } else if (exceptionAnswer[pred] != null) {
             leafValues[pred] = exceptionAnswer[pred];
+          } else if (prunings[pred].isSkipped(rowGroup)) {
+            // the statistics rule this row group out, so the predicate would
+            // return the truth value that is recorded here
+            leafValues[pred] = prunings[pred].getSkippedValue(rowGroup);
           } else {
             if (indexes[columnIx] == null) {
               LOG.warn("Index is not populated for " + columnIx);
@@ -1352,6 +1399,9 @@ public class RecordReaderImpl implements RecordReader {
           }
         }
         result[rowGroup] = sarg.evaluate(leafValues).isNeeded();
+        if (truthValues != null) {
+          truthValues[rowGroup] = leafValues.clone();
+        }
         hasSelected = hasSelected || result[rowGroup];
         hasSkipped = hasSkipped || (!result[rowGroup]);
         if (LOG.isDebugEnabled()) {
@@ -1362,6 +1412,315 @@ public class RecordReaderImpl implements RecordReader {
       }
 
       return hasSkipped ? ((hasSelected || !returnNone) ? result : READ_NO_RGS) : READ_ALL_RGS;
+    }
+
+    /**
+     * Locate the row groups that the statistics of an ordered column rule out
+     * for each predicate leaf, by binary searching the row group index.
+     * <p>
+     * The statistics of a sorted column are ordered by row group inside a
+     * stripe, so the row groups that fall outside of the interval found by the
+     * binary search cannot match the predicate and evaluating it against their
+     * statistics is a waste. The columns whose statistics are not ordered get
+     * the whole set of row groups, which keeps the linear evaluation.
+     *
+     * @param indexes the row indexes of the stripe, aligned with the columns
+     * @param groupsInStripe the number of row groups in the stripe
+     * @return the row groups to skip, one per predicate leaf
+     */
+    RowGroupPruning[] buildRowGroupPrunings(OrcProto.RowIndex[] indexes,
+                                            int groupsInStripe) {
+      RowGroupPruning[] prunings = new RowGroupPruning[sargLeaves.size()];
+      for (int pred = 0; pred < prunings.length; ++pred) {
+        prunings[pred] = RowGroupPruning.NO_PRUNING;
+        int columnIx = filterColumns[pred];
+        if (columnIx < 0 || columnIx >= indexes.length || indexes[columnIx] == null ||
+            evolution == null || !evolution.isPPDSafeConversion(columnIx)) {
+          continue;
+        }
+        prunings[pred] = buildRowGroupPruning(indexes[columnIx],
+            evolution.getFileSchema().findSubtype(columnIx),
+            sargLeaves.get(pred), groupsInStripe);
+      }
+      return prunings;
+    }
+
+    /**
+     * Find the row groups of one column that the predicate may match.
+     *
+     * @param index the row index of the column
+     * @param type the type of the column in the file
+     * @param predicate the predicate leaf to locate
+     * @param groupsInStripe the number of row groups in the stripe
+     * @return the row groups that cannot match, or
+     * {@link RowGroupPruning#NO_PRUNING} if the statistics cannot be searched
+     */
+    private RowGroupPruning buildRowGroupPruning(OrcProto.RowIndex index,
+                                                 TypeDescription type,
+                                                 PredicateLeaf predicate,
+                                                 int groupsInStripe) {
+      if (index.getEntryCount() < groupsInStripe) {
+        return RowGroupPruning.NO_PRUNING;
+      }
+      Comparable[] lower = new Comparable[groupsInStripe];
+      Comparable[] upper = new Comparable[groupsInStripe];
+      boolean[] hasNulls = new boolean[groupsInStripe];
+      try {
+        for (int rowGroup = 0; rowGroup < groupsInStripe; ++rowGroup) {
+          OrcProto.RowIndexEntry entry = index.getEntry(rowGroup);
+          if (!entry.hasStatistics()) {
+            return RowGroupPruning.NO_PRUNING;
+          }
+          ColumnStatistics cs = ColumnStatisticsImpl.deserialize(null,
+              entry.getStatistics(), writerUsedProlepticGregorian, true);
+          ValueRange range = getValueRange(cs, predicate, useUTCTimestamp);
+          // the bounds are only usable when both of them are set and the value
+          // range keeps both of them, and the writer version is always checked
+          // before the minimum and the maximum are compared
+          if (!range.isComparable() || range.onlyLowerBound || range.onlyUpperBound ||
+              range.lower == null || range.upper == null ||
+              checkWriterVersion(range, predicate, writerVersion, type, cs) != null) {
+            return RowGroupPruning.NO_PRUNING;
+          }
+          lower[rowGroup] = range.lower;
+          upper[rowGroup] = range.upper;
+          hasNulls[rowGroup] = range.hasNulls;
+        }
+        return RowGroupPruning.build(lower, upper, hasNulls, predicate);
+      } catch (RuntimeException e) {
+        // the statistics cannot be compared with the predicate, so let the
+        // linear evaluation report the failure of each row group on its own
+        return RowGroupPruning.NO_PRUNING;
+      }
+    }
+
+    /**
+     * The interval of row groups that may match a predicate, found by binary
+     * searching the ordered statistics of a column, together with the null
+     * counts needed to answer for the row groups outside of that interval.
+     * <p>
+     * The predicate of a skipped row group compares its arguments against
+     * minimum and maximum that lie on the far side of the arguments, so it
+     * would return {@link TruthValue#NO}, or {@link TruthValue#NO_NULL} when
+     * the statistics hold nulls. The bloom filters are not consulted for these
+     * row groups, because they are only consulted once the minimum and the
+     * maximum have left the answer undetermined.
+     */
+    static class RowGroupPruning {
+      static final RowGroupPruning NO_PRUNING = new RowGroupPruning(0, 0, null);
+
+      // the row groups before lo and at or after hi cannot match
+      private final int lo;
+      private final int hi;
+      // the null counts of the statistics, null when there is no pruning
+      private final boolean[] hasNulls;
+
+      private RowGroupPruning(int lo, int hi, boolean[] hasNulls) {
+        this.lo = lo;
+        this.hi = hi;
+        this.hasNulls = hasNulls;
+      }
+
+      /**
+       * Binary search the statistics of a column to find the row groups that
+       * may match the predicate.
+       *
+       * @param lower the minimum of every row group, in row group order
+       * @param upper the maximum of every row group, in row group order
+       * @param hasNulls the null count of every row group, in row group order
+       * @param predicate the predicate leaf to locate
+       * @return the row groups that cannot match the predicate
+       */
+      static RowGroupPruning build(Comparable[] lower,
+                                   Comparable[] upper,
+                                   boolean[] hasNulls,
+                                   PredicateLeaf predicate) {
+        int groups = lower.length;
+        int order = findOrder(lower, upper, groups);
+        if (order == 0) {
+          return NO_PRUNING;
+        }
+        PredicateLeaf.Type type = predicate.getType();
+        boolean ascending = order > 0;
+        int lo;
+        int hi;
+        switch (predicate.getOperator()) {
+          case EQUALS: {
+            // the value has to be within the minimum and the maximum
+            Comparable value = getBaseObjectForComparison(type,
+                (Comparable) predicate.getLiteral());
+            lo = ascending ? firstAtLeast(upper, value, groups) :
+                firstAtMost(lower, value, groups);
+            hi = ascending ? firstGreater(lower, value, groups) :
+                firstLess(upper, value, groups);
+            break;
+          }
+          case LESS_THAN: {
+            // the value has to be above the minimum
+            Comparable value = getBaseObjectForComparison(type,
+                (Comparable) predicate.getLiteral());
+            lo = ascending ? 0 : firstLess(lower, value, groups);
+            hi = ascending ? firstAtLeast(lower, value, groups) : groups;
+            break;
+          }
+          case LESS_THAN_EQUALS: {
+            // the value has to be at or above the minimum
+            Comparable value = getBaseObjectForComparison(type,
+                (Comparable) predicate.getLiteral());
+            lo = ascending ? 0 : firstAtMost(lower, value, groups);
+            hi = ascending ? firstGreater(lower, value, groups) : groups;
+            break;
+          }
+          case BETWEEN: {
+            List<Object> args = predicate.getLiteralList();
+            if (args == null || args.size() != 2) {
+              return NO_PRUNING;
+            }
+            Comparable low = getBaseObjectForComparison(type, (Comparable) args.get(0));
+            Comparable high = getBaseObjectForComparison(type, (Comparable) args.get(1));
+            if (low.compareTo(high) > 0) {
+              // the arguments are inverted, so the interval cannot be located
+              return NO_PRUNING;
+            }
+            // the values have to be within the two arguments
+            lo = ascending ? firstAtLeast(upper, low, groups) :
+                firstAtMost(lower, high, groups);
+            hi = ascending ? firstGreater(lower, high, groups) :
+                firstLess(upper, low, groups);
+            break;
+          }
+          default:
+            // the remaining operators, which are the null safe equals, the in
+            // list, the is null and the greater than ones that the operator
+            // enum does not have, are left to the linear evaluation
+            return NO_PRUNING;
+        }
+        return lo >= hi ? new RowGroupPruning(0, 0, hasNulls) :
+            new RowGroupPruning(lo, hi, hasNulls);
+      }
+
+      /**
+       * Find out whether the minimum and the maximum are ordered by row group,
+       * which is the case for the sorted columns of a stripe.
+       *
+       * @return 1 when they are ascending, -1 when they are descending, and 0
+       * when they are not ordered
+       */
+      private static int findOrder(Comparable[] lower, Comparable[] upper, int groups) {
+        int order = 0;
+        for (int i = 1; i < groups && order == 0; ++i) {
+          order = Integer.signum(lower[i].compareTo(lower[i - 1]));
+        }
+        for (int i = 1; i < groups && order == 0; ++i) {
+          order = Integer.signum(upper[i].compareTo(upper[i - 1]));
+        }
+        if (order == 0) {
+          // the statistics do not change, which is both ascending and descending
+          return 1;
+        }
+        for (int i = 1; i < groups; ++i) {
+          if (Integer.signum(lower[i].compareTo(lower[i - 1])) * order < 0 ||
+              Integer.signum(upper[i].compareTo(upper[i - 1])) * order < 0) {
+            return 0;
+          }
+        }
+        return order;
+      }
+
+      /**
+       * Find the first row group whose statistic is not below the value, in
+       * statistics that do not decrease.
+       */
+      private static int firstAtLeast(Comparable[] statistics,
+                                      Comparable value,
+                                      int groups) {
+        int lo = 0;
+        int hi = groups;
+        while (lo < hi) {
+          int mid = (lo + hi) >>> 1;
+          if (value.compareTo(statistics[mid]) <= 0) {
+            hi = mid;
+          } else {
+            lo = mid + 1;
+          }
+        }
+        return lo;
+      }
+
+      /**
+       * Find the first row group whose statistic is above the value, in
+       * statistics that do not decrease.
+       */
+      private static int firstGreater(Comparable[] statistics,
+                                      Comparable value,
+                                      int groups) {
+        int lo = 0;
+        int hi = groups;
+        while (lo < hi) {
+          int mid = (lo + hi) >>> 1;
+          if (value.compareTo(statistics[mid]) < 0) {
+            hi = mid;
+          } else {
+            lo = mid + 1;
+          }
+        }
+        return lo;
+      }
+
+      /**
+       * Find the first row group whose statistic is not above the value, in
+       * statistics that do not increase.
+       */
+      private static int firstAtMost(Comparable[] statistics,
+                                     Comparable value,
+                                     int groups) {
+        int lo = 0;
+        int hi = groups;
+        while (lo < hi) {
+          int mid = (lo + hi) >>> 1;
+          if (value.compareTo(statistics[mid]) >= 0) {
+            hi = mid;
+          } else {
+            lo = mid + 1;
+          }
+        }
+        return lo;
+      }
+
+      /**
+       * Find the first row group whose statistic is below the value, in
+       * statistics that do not increase.
+       */
+      private static int firstLess(Comparable[] statistics,
+                                  Comparable value,
+                                  int groups) {
+        int lo = 0;
+        int hi = groups;
+        while (lo < hi) {
+          int mid = (lo + hi) >>> 1;
+          if (value.compareTo(statistics[mid]) > 0) {
+            hi = mid;
+          } else {
+            lo = mid + 1;
+          }
+        }
+        return lo;
+      }
+
+      /**
+       * Do the statistics of this row group rule the predicate out?
+       */
+      boolean isSkipped(int rowGroup) {
+        return hasNulls != null && (rowGroup < lo || rowGroup >= hi);
+      }
+
+      /**
+       * The truth value that evaluating the predicate against the statistics of
+       * a skipped row group returns.
+       */
+      TruthValue getSkippedValue(int rowGroup) {
+        return hasNulls[rowGroup] ? TruthValue.NO_NULL : TruthValue.NO;
+      }
     }
 
     /**
