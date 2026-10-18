@@ -63,6 +63,10 @@ import java.util.Set;
  */
 public class StripePlanner {
   private static final Logger LOG = LoggerFactory.getLogger(StripePlanner.class);
+  // the streams that hold the dictionary of a dictionary encoded column
+  private static final OrcProto.Stream.Kind[] DICTIONARY_STREAM_KINDS = {
+      OrcProto.Stream.Kind.LENGTH, OrcProto.Stream.Kind.DICTIONARY_DATA
+  };
   // global information
   private final TypeDescription schema;
   private final OrcFile.WriterVersion version;
@@ -223,6 +227,29 @@ public class StripePlanner {
     return stream == null ? null
       : InStream.create(name, stream.firstChunk, stream.offset, stream.length,
             getStreamOptions(stream.column, stream.kind));
+  }
+
+  /**
+   * Read the dictionary streams of the given columns of the current stripe,
+   * so that a caller can check the dictionary values without reading the data
+   * streams of the stripe. The buffers are reused when the data of the stripe
+   * is read, so reading the dictionaries first does not read them twice.
+   * @param columns the file columns whose dictionaries should be read
+   * @throws IOException if the dictionaries can not be read
+   */
+  public void readDictionaries(Set<Integer> columns) throws IOException {
+    BufferChunkList chunks = new BufferChunkList();
+    for(int column: columns) {
+      for(OrcProto.Stream.Kind kind: DICTIONARY_STREAM_KINDS) {
+        StreamInformation stream = streams.get(new StreamName(column, kind));
+        if (stream != null) {
+          addWholeStream(chunks, stream);
+        }
+      }
+    }
+    if (chunks.get() != null) {
+      dataReader.readFileData(chunks, false);
+    }
   }
 
   /**
@@ -428,6 +455,17 @@ public class StripePlanner {
     return output;
   }
 
+  /**
+   * Add the whole range of a stream, unless the stream has already been read
+   * (to check the dictionary for pruning), in which case the buffer that is
+   * held in the stream is reused.
+   */
+  private void addWholeStream(BufferChunkList list, StreamInformation stream) {
+    if (stream.firstChunk == null) {
+      addChunk(list, stream, stream.offset, stream.length);
+    }
+  }
+
   private void addChunk(BufferChunkList list, StreamInformation stream,
                         long offset, long length) {
     while (length > 0) {
@@ -484,7 +522,7 @@ public class StripePlanner {
       if (readPhase == TypeReader.ReadPhase.ALL ||
           (readPhase == TypeReader.ReadPhase.LEADERS && filterColIds.contains(stream.column)) ||
           (readPhase == TypeReader.ReadPhase.FOLLOWERS && !filterColIds.contains(stream.column))) {
-        addChunk(result, stream, stream.offset, stream.length);
+        addWholeStream(result, stream);
       } else {
         // In case a filter is present, then don't plan the lazy columns, they will be planned only
         // as needed.
@@ -578,7 +616,7 @@ public class StripePlanner {
                              boolean isCompressed,
                              int bufferSize) {
     if (RecordReaderUtils.isDictionary(stream.kind, encodings[stream.column])) {
-      addChunk(result, stream, stream.offset, stream.length);
+      addWholeStream(result, stream);
     } else {
       int column = stream.column;
       OrcProto.RowIndex ri = rowIndex[column];
