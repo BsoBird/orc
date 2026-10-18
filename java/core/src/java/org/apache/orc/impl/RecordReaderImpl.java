@@ -52,6 +52,10 @@ import org.apache.orc.impl.filter.FilterFactory;
 import org.apache.orc.impl.reader.ReaderEncryption;
 import org.apache.orc.impl.reader.StripePlanner;
 import org.apache.orc.impl.reader.StripePlannerFactory;
+import org.apache.orc.impl.reader.WindowedDataReader;
+import org.apache.orc.impl.reader.WindowedReadConfig;
+import org.apache.orc.impl.reader.WindowedScanContext;
+import org.apache.orc.impl.reader.WindowedStripePlannerFactory;
 import org.apache.orc.impl.reader.tree.BatchReader;
 import org.apache.orc.impl.reader.tree.TypeReader;
 import org.apache.orc.util.BloomFilter;
@@ -110,7 +114,7 @@ public class RecordReaderImpl implements RecordReader {
   private boolean[] includedRowGroups = null;
   // an array about which stripes aren't skipped, null if all of them are read
   private boolean[] includedStripes = null;
-  private final DataReader dataReader;
+  private DataReader dataReader;
   private final int maxDiskRangeChunkLimit;
   private final StripePlanner planner;
   // identifies the type of read, ALL(read everything), LEADERS(read only the filter columns)
@@ -388,7 +392,23 @@ public class RecordReaderImpl implements RecordReader {
         new OrcProto.Stream.Kind[columns],
         new OrcProto.BloomFilterIndex[columns]);
 
+    // The windowed read arm is opt-in and off by default. With the flag off
+    // this block is the identity: the same reader, the same planner and the
+    // same requests as an unadorned reader. With it on, the data reader is
+    // wrapped so that the stripes of a window are fetched in two merged
+    // requests instead of one per stripe per phase.
+    WindowedReadConfig windowedConfig = new WindowedReadConfig(fileReader.conf);
+    WindowedScanContext windowedContext = null;
+    if (windowedConfig.isEnabled()) {
+      windowedContext = new WindowedScanContext(stripes, includedStripes, sargApp,
+          fileIncluded, rowIndexColsToRead, startReadPhase, skipBloomFilters, columns);
+      dataReader = new WindowedDataReader(dataReader, windowedConfig, windowedContext);
+    }
+
     StripePlannerFactory plannerFactory = options.getStripePlannerFactory();
+    if (plannerFactory == null && windowedContext != null) {
+      plannerFactory = new WindowedStripePlannerFactory();
+    }
     if (plannerFactory == null) {
       planner = new StripePlanner(evolution.getFileSchema(), encryption,
                                   dataReader, writerVersion, ignoreNonUtf8BloomFilter,
@@ -472,6 +492,20 @@ public class RecordReaderImpl implements RecordReader {
   public OrcProto.StripeFooter readStripeFooter(StripeInformation stripe
                                                 ) throws IOException {
     return dataReader.readStripeFooter(stripe);
+  }
+
+  /**
+   * Get the stripe planner that is driving this reader.
+   *
+   * The planner is installed either directly or by a
+   * {@link org.apache.orc.impl.reader.StripePlannerFactory}, so the reader is
+   * the only place a caller can see it. Tests and instrumentation use it to
+   * reach whatever the planner wrapped around the data reader.
+   *
+   * @return the stripe planner for this reader
+   */
+  public StripePlanner getStripePlanner() {
+    return planner;
   }
 
   enum Location {
