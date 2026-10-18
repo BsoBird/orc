@@ -257,7 +257,59 @@ public enum OrcConf {
   ROW_BATCH_CHILD_LIMIT("orc.row.child.limit", "orc.row.child.limit",
       1024 * 32, "The maximum number of child elements to buffer before "+
       "the ORC row writer writes the batch to the file."
-      )
+      ),
+  ORC_WINDOWED_READ_ENABLED("orc.windowed.read.enabled",
+      "orc.windowed.read.enabled", false,
+      "A boolean flag to enable the cross-stripe windowed read. When it is true the\n" +
+      "reader may fetch the stripe footers, row indexes and data of several stripes\n" +
+      "in coalesced windowed requests instead of one request per stripe. The rows\n" +
+      "returned are the same either way: only which bytes are read, and in how\n" +
+      "many round trips, may change. When it is false (the default) the reader\n" +
+      "behaves exactly as it did before this option existed."),
+  ORC_WINDOWED_WINDOW_BYTES("orc.windowed.window.bytes",
+      "orc.windowed.window.bytes", 8L << 20,
+      "The largest file span, in bytes, that one window of the cross-stripe\n" +
+      "windowed read may cover. Windows are packed so that the stripes of a\n" +
+      "window never span more than this many bytes."),
+  ORC_WINDOWED_GAP_BYTES("orc.windowed.gap.bytes",
+      "orc.windowed.gap.bytes", 1L << 20,
+      "The largest gap, in bytes, that the windowed read may coalesce across.\n" +
+      "Bytes inside a gap no larger than this are read together with the ranges\n" +
+      "on either side of it; a larger gap is left to be seeked over."),
+  ORC_WINDOWED_GATE_LATENCY_MS("orc.windowed.gate.latency.ms",
+      "orc.windowed.gate.latency.ms", 50L,
+      "The assumed round trip latency, in milliseconds, of the storage the\n" +
+      "windowed read is running over. One saved round trip is credited this much\n" +
+      "time, and every extra byte the window fetches ahead of the scan is\n" +
+      "charged against it. Zero stands every window down, because there is then\n" +
+      "no round trip to save and every bridged byte is pure cost."),
+  ORC_WINDOWED_GATE_MBPS("orc.windowed.gate.mbps",
+      "orc.windowed.gate.mbps", 100.0d,
+      "The assumed bandwidth, in megabytes per second, of the storage the windowed\n" +
+      "read is running over. It is the price the gate puts on the bytes a window\n" +
+      "fetches ahead of the scan."),
+  ORC_WINDOWED_GATE_SAFETY("orc.windowed.gate.safety",
+      "orc.windowed.gate.safety", 3.0d,
+      "The pessimism factor of the gate's link model. Both the latency a saved\n" +
+      "round trip is credited at and the bandwidth the extra bytes are charged at\n" +
+      "are divided by this, which is the conservative corner of a link that is\n" +
+      "this many times faster and this many times narrower than the model."),
+  ORC_WINDOWED_GATE_MARGIN_MS("orc.windowed.gate.margin.ms",
+      "orc.windowed.gate.margin.ms", 0.0d,
+      "The break-even margin, in milliseconds, that a window must beat before it\n" +
+      "is allowed to engage. It is the fixed cost the gate charges every window\n" +
+      "so that a window which merely ties is refused rather than engaged."),
+  ORC_WINDOWED_GATE_MIN_SAVED("orc.windowed.gate.min.saved",
+      "orc.windowed.gate.min.saved", 1.0d,
+      "The smallest number of round trips a window may save and still engage.\n" +
+      "It keeps the gate from admitting windows whose whole return is a fraction\n" +
+      "of one request."),
+  ORC_WINDOWED_MAX_EXTRA_BYTES("orc.windowed.max.extra.bytes",
+      "orc.windowed.max.extra.bytes", 32L << 20,
+      "The absolute ceiling, in bytes, on the speculative over-read a single\n" +
+      "window may perform. It is the last of the three terms that bound a\n" +
+      "window's credit, and it exists so that no configuration of the other\n" +
+      "options can raise the windowed read's over-read without limit.")
   ;
 
   private final String attribute;
