@@ -317,7 +317,19 @@ public enum OrcConf {
       "contain rows matching the search argument. Only conjunctions of plain\n" +
       "comparisons of a string column are used for this, so predicates that\n" +
       "involve negation, null tests or disjunction fall back to the normal\n" +
-      "read path.")
+      "read path."),
+  PARALLEL_FOOTER_READ("orc.footer.read.parallel",
+      "orc.footer.read.parallel", false,
+      "Should the readers prefetch the footers of several files at once instead\n" +
+      "of reading them one file at a time? The footers of a multi-file scan are\n" +
+      "independent, so reading them in parallel collapses a chain of round trips\n" +
+      "into a few. It is off by default because it trades a small amount of\n" +
+      "parallelism for a small amount of extra bookkeeping."),
+  FOOTER_READ_PARALLELISM("orc.footer.read.parallelism",
+      "orc.footer.read.parallelism", 5,
+      "How many files may have their footers read at the same time by\n" +
+      "ParallelFooterReader. It only applies where the parallel footer read is\n" +
+      "enabled.")
   ;
 
   private final String attribute;
