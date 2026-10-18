@@ -301,6 +301,18 @@ public class ReaderImpl implements Reader {
     return tail.getFileTail();
   }
 
+  /**
+   * Get the tail of the file, which holds the parsed footer together with the
+   * bytes it was parsed from. A tail that came from a reader that has been
+   * closed is still usable: it needs no file handle to read the metadata and
+   * the stripe statistics.
+   * @return the tail of the file, or null if the reader was built from the
+   *         deprecated FileMetadata
+   */
+  public OrcTail getTail() {
+    return tail;
+  }
+
   @Override
   public EncryptionKey[] getColumnEncryptionKeys() {
     return encryption.getKeys();
