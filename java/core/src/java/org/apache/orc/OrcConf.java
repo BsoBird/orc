@@ -309,7 +309,15 @@ public enum OrcConf {
       "The absolute ceiling, in bytes, on the speculative over-read a single\n" +
       "window may perform. It is the last of the three terms that bound a\n" +
       "window's credit, and it exists so that no configuration of the other\n" +
-      "options can raise the windowed read's over-read without limit.")
+      "options can raise the windowed read's over-read without limit."),
+  DICTIONARY_BLOCK_PRUNE_ENABLED("orc.dictionary.block.prune.enabled",
+      "orc.dictionary.block.prune.enabled", true,
+      "A boolean flag to determine if the reader uses the dictionary of a fully\n" +
+      "dictionary encoded string column to skip whole stripes which can not\n" +
+      "contain rows matching the search argument. Only conjunctions of plain\n" +
+      "comparisons of a string column are used for this, so predicates that\n" +
+      "involve negation, null tests or disjunction fall back to the normal\n" +
+      "read path.")
   ;
 
   private final String attribute;

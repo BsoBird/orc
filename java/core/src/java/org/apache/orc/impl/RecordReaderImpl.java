@@ -114,6 +114,12 @@ public class RecordReaderImpl implements RecordReader {
   private boolean[] includedRowGroups = null;
   // an array about which stripes aren't skipped, null if all of them are read
   private boolean[] includedStripes = null;
+  // an array about which stripes were skipped because their dictionary proved
+  // that they can not match the search argument, null if the dictionaries of
+  // the file are not used for pruning
+  private boolean[] dictionaryPrunedStripes = null;
+  // the pruner of the stripes whose dictionary can not match the search argument
+  private DictionaryBlockPruner dictionaryPruner = null;
   private DataReader dataReader;
   private final int maxDiskRangeChunkLimit;
   private final StripePlanner planner;
@@ -386,6 +392,19 @@ public class RecordReaderImpl implements RecordReader {
           .setEncryption(encryption);
     reader = TreeReaderFactory.createRootReader(evolution.getReaderSchema(), readerContext);
     skipBloomFilters = hasBadBloomFilters(fileReader.getFileTail().getFooter());
+
+    // A stripe whose dictionary can not match the search argument is skipped
+    // without reading its data streams. This does not depend on the row index
+    // stride, so it also prunes the files that have no row index at all.
+    if (sarg != null && OrcConf.DICTIONARY_BLOCK_PRUNE_ENABLED.getBoolean(fileReader.conf)) {
+      dictionaryPruner = DictionaryBlockPruner.create(sarg, evolution, encryption,
+          readerContext);
+      if (dictionaryPruner != null) {
+        dictionaryPrunedStripes = new boolean[this.stripes.size()];
+        LOG.debug("Dictionary pruning is checking the stripes of {} columns",
+            dictionaryPruner.getColumnCount());
+      }
+    }
 
     int columns = evolution.getFileSchema().getMaximumId() + 1;
     indexes = new OrcIndex(new OrcProto.RowIndex[columns],
@@ -1536,6 +1555,15 @@ public class RecordReaderImpl implements RecordReader {
 
     // if we haven't skipped the whole stripe, read the data
     if (rowInStripe < rowCountInStripe) {
+      // the dictionary of a fully dictionary encoded string column may already
+      // prove that no row of this stripe matches the search argument, which is
+      // decided from the dictionary alone and without its data streams
+      if (dictionaryPruner != null && !dictionaryPrunedStripes[currentStripe] &&
+          dictionaryPruner.canSkipStripe(planner)) {
+        dictionaryPrunedStripes[currentStripe] = true;
+        skipStripe();
+        return;
+      }
       planner.readData(indexes, includedRowGroups, false, startReadPhase);
       reader.startStripe(planner, startReadPhase);
       needsFollowColumnsRead = true;
@@ -1906,6 +1934,14 @@ public class RecordReaderImpl implements RecordReader {
     if (pruned) {
       includedStripes[rightStripe] = true;
     }
+    // the same holds for a stripe that its dictionary proved to have no
+    // matching rows
+    boolean dictionaryPruned = dictionaryPrunedStripes != null &&
+        dictionaryPrunedStripes[rightStripe];
+    if (dictionaryPruned) {
+      dictionaryPrunedStripes[rightStripe] = false;
+    }
+    pruned |= dictionaryPruned;
     if (pruned || rightStripe != currentStripe) {
       currentStripe = rightStripe;
       readStripe();
