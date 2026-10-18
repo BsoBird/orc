@@ -638,6 +638,10 @@ public class WindowedDataReader implements DataReader {
       collect(delegate.readFileData(roundTwo, false), spans);
     }
 
+    // The two rounds cover disjoint byte intervals, but round two lands after
+    // round one in the list. Everything that walks the spans -- subtracting
+    // them, and slicing out of them -- needs them in file order.
+    spans.sort(Comparator.comparingLong(span -> span.start));
     window.spans = spans;
   }
 
