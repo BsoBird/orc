@@ -24,9 +24,16 @@ import java.io.EOFException;
 import java.io.IOException;
 
 public final class BitFieldReader {
+  private static final int MAX_BULK_BYTES = 1 << 13;
   private final RunLengthByteReader input;
   private int current;
   private byte currentIdx = 8;
+  /**
+   * Scratch buffer for the bytes of the current batch. It is reused between
+   * the batches and is fully consumed before returning, so that seeking and
+   * skipping only ever see the state of the underlying reader.
+   */
+  private byte[] bulk = null;
 
   public BitFieldReader(InStream input) {
     this.input = new RunLengthByteReader(input);
@@ -49,6 +56,197 @@ public final class BitFieldReader {
     currentIdx++;
     // Highest bit is the first val
     return ((current >>> (8 - currentIdx)) & 1);
+  }
+
+  /**
+   * Read the next length bits from the bit field, marking the null values.
+   *
+   * <p>The bits are consumed in bulk, a byte at a time, rather than one
+   * {@link #next()} call at a time. The most significant bit of a byte is the
+   * first value, exactly as in {@link #next()}, and reading past the end of
+   * the field still raises an {@link EOFException}.</p>
+   *
+   * <p>The bits are the present flags of the rows, so a 1 bit means that the
+   * row has a value and a 0 bit means that the row is null.</p>
+   *
+   * @param isNull the array that the null flags are written into, where
+   *               isNull[offset + i] is true if row i is null. If it is null,
+   *               the values are only counted.
+   * @param parentIsNull the null flags of the enclosing reader, if any. No
+   *                     bit is consumed for the rows where it is true.
+   * @param offset the first row to fill in
+   * @param length the number of rows to read
+   * @return the number of rows that are not null
+   * @throws IllegalArgumentException if the offset or the length is negative,
+   *         if the rows don't fit in the given arrays, or if the rows run past
+   *         the end of the address space
+   */
+  public long nextVector(boolean[] isNull,
+                         boolean[] parentIsNull,
+                         int offset,
+                         long length) throws IOException {
+    final int size = checkRange(isNull, parentIsNull, offset, length);
+    if (size == 0) {
+      return 0;
+    }
+    if (parentIsNull == null) {
+      // Every row has a bit of its own, so read the whole batch in one run.
+      return readBits(isNull, offset, size);
+    }
+    long nonNulls = 0;
+    int pos = offset;
+    final int end = offset + size;
+    while (pos < end) {
+      if (parentIsNull[pos]) {
+        // The parent is null, so this row doesn't have a bit of its own.
+        if (isNull != null) {
+          isNull[pos] = true;
+        }
+        pos += 1;
+      } else {
+        // Find the end of the run of rows that consume a bit each.
+        int runEnd = pos + 1;
+        while (runEnd < end && !parentIsNull[runEnd]) {
+          runEnd += 1;
+        }
+        nonNulls += readBits(isNull, pos, runEnd - pos);
+        pos = runEnd;
+      }
+    }
+    return nonNulls;
+  }
+
+  /**
+   * Check that a batch of rows can be read into the given arrays.
+   *
+   * @param isNull the array that the null flags are written into, if any
+   * @param parentIsNull the null flags of the enclosing reader, if any
+   * @param offset the first row to fill in
+   * @param length the number of rows to read
+   * @return the number of rows to read, where offset + length is known not to
+   *         overflow an int
+   */
+  private static int checkRange(boolean[] isNull,
+                                boolean[] parentIsNull,
+                                int offset,
+                                long length) {
+    if (offset < 0) {
+      throw new IllegalArgumentException("The offset " + offset +
+          " of a bit field batch must not be negative");
+    }
+    if (length < 0) {
+      throw new IllegalArgumentException("The length " + length +
+          " of a bit field batch must not be negative");
+    }
+    if (length > Integer.MAX_VALUE) {
+      throw new IllegalArgumentException("The length " + length +
+          " of a bit field batch is too large to read");
+    }
+    final int size = (int) length;
+    // The rows are found using an int end marker, so the batch has to fit in
+    // the address space even when there are no arrays to check it against.
+    if (offset + (long) size > Integer.MAX_VALUE) {
+      throw new IllegalArgumentException("Reading " + size + " bit field rows" +
+          " at " + offset + " runs past the end of the address space");
+    }
+    if (isNull != null && offset + (long) size > isNull.length) {
+      throw new IllegalArgumentException("Reading " + size + " bit field rows" +
+          " at " + offset + " doesn't fit in an array of " + isNull.length);
+    }
+    if (parentIsNull != null && offset + (long) size > parentIsNull.length) {
+      throw new IllegalArgumentException("Checking " + size + " bit field rows" +
+          " at " + offset + " doesn't fit in an array of " +
+          parentIsNull.length);
+    }
+    return size;
+  }
+
+  /**
+   * The number of bytes that hold the given number of bits.
+   *
+   * @param bits the number of bits
+   * @return the number of bytes that they need, rounded up, or 0 if there are
+   *         no bits to hold
+   */
+  static int bytesForBits(int bits) {
+    if (bits <= 0) {
+      return 0;
+    }
+    // ((bits - 1) / 8) + 1 rounds up without overflowing bits + 7, which
+    // wraps negative when there are Integer.MAX_VALUE bits to hold.
+    return ((bits - 1) / 8) + 1;
+  }
+
+  /**
+   * Read a run of bits, setting the null flags of the rows.
+   *
+   * @param isNull the array that the null flags are written into, or null to
+   *               only count the values
+   * @param offset the first row to fill in
+   * @param length the number of rows to read
+   * @return the number of rows that are not null
+   */
+  private int readBits(boolean[] isNull, int offset, int length)
+      throws IOException {
+    int nonNulls = 0;
+    int pos = offset;
+    int remaining = length;
+    int available = 8 - currentIdx;
+    int bulkIdx = 0;
+    int bulkSize = 0;
+    while (remaining > 0) {
+      if (available == 0) {
+        if (bulkIdx >= bulkSize) {
+          // Read the bytes that hold the remaining bits all at once, so that
+          // the runs of the underlying reader are handled in bulk. The number
+          // of bytes is exact, so the end of the field is found at the same
+          // place as it is by next().
+          bulkSize = Math.min(bytesForBits(remaining), MAX_BULK_BYTES);
+          if (bulk == null || bulk.length < bulkSize) {
+            bulk = new byte[bulkSize];
+          }
+          fillBytes(bulk, bulkSize);
+          bulkIdx = 0;
+        }
+        current = 0xff & bulk[bulkIdx++];
+        currentIdx = 0;
+        available = 8;
+      }
+      final int consume = Math.min(available, remaining);
+      final int bits =
+          (current >>> (8 - currentIdx - consume)) & ((1 << consume) - 1);
+      // The bits are the present flags, where a 1 bit means that the row has
+      // a value and a 0 bit means that the row is null.
+      nonNulls += Integer.bitCount(bits);
+      if (isNull != null) {
+        // The most significant of the bits is the first row.
+        for (int i = 0; i < consume; ++i) {
+          isNull[pos + i] = ((bits >>> (consume - 1 - i)) & 1) == 0;
+        }
+      }
+      currentIdx += consume;
+      pos += consume;
+      remaining -= consume;
+      available = 8 - currentIdx;
+    }
+    return nonNulls;
+  }
+
+  /**
+   * Fill the buffer with the next bytes of the underlying reader.
+   *
+   * @param bytes the buffer to fill in
+   * @param count the number of bytes to read
+   */
+  private void fillBytes(byte[] bytes, int count) throws IOException {
+    try {
+      input.nextBytes(bytes, 0, count);
+    } catch (EOFException e) {
+      final EOFException failure =
+          new EOFException("Read past end of bit field from " + this);
+      failure.initCause(e);
+      throw failure;
+    }
   }
 
   public void nextVector(LongColumnVector previous,

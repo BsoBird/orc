@@ -21,6 +21,7 @@ import org.apache.hadoop.hive.ql.exec.vector.ColumnVector;
 
 import java.io.EOFException;
 import java.io.IOException;
+import java.util.Arrays;
 
 /**
  * A reader that reads a sequence of bytes. A control byte is read before
@@ -96,6 +97,39 @@ public class RunLengthByteReader {
       result = literals[used];
     }
     ++used;
+    return result;
+  }
+
+  /**
+   * Read a bulk of the next bytes into the given array.
+   *
+   * <p>This is equivalent to calling {@link #next()} {@code length} times,
+   * including the run boundaries and the end of the buffer, but it copies the
+   * values run by run instead of one byte at a time.</p>
+   *
+   * @param bytes the array to read the values into
+   * @param offset the first index of bytes to fill in
+   * @param length the number of bytes to read
+   * @return the number of bytes that were read
+   * @throws IOException if the buffer ends before the values are read
+   */
+  public int nextBytes(byte[] bytes, int offset, int length) throws IOException {
+    int result = 0;
+    while (result < length) {
+      if (used == numLiterals) {
+        readValues(false, 0);
+      }
+      final long available = numLiterals - used;
+      final int consume = (int) Math.min(available, (long) length - result);
+      if (repeat) {
+        Arrays.fill(bytes, offset + result, offset + result + consume,
+            literals[0]);
+      } else {
+        System.arraycopy(literals, used, bytes, offset + result, consume);
+      }
+      used += consume;
+      result += consume;
+    }
     return result;
   }
 

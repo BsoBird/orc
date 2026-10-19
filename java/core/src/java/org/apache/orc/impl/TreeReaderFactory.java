@@ -53,6 +53,7 @@ import java.io.IOException;
 import java.text.DateFormat;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -223,6 +224,12 @@ public class TreeReaderFactory {
     protected final Context context;
     protected final ReaderCategory readerCategory;
 
+    /**
+     * The maximum number of present bits that countNonNulls consumes at a
+     * time, so that a large skip doesn't need a single loop iteration per row.
+     */
+    private static final int MAX_PRESENT_BATCH = 1 << 16;
+
     static final long[] powerOfTenTable = {
         1L,                   // 0
         10L,
@@ -329,11 +336,14 @@ public class TreeReaderFactory {
 
     protected long countNonNulls(long rows) throws IOException {
       if (present != null) {
+        // The present bits are consumed in bulk a batch at a time, so that the
+        // underlying reader isn't called once per row.
         long result = 0;
-        for (long c = 0; c < rows; ++c) {
-          if (present.next() == 1) {
-            result += 1;
-          }
+        long remaining = rows;
+        while (remaining > 0) {
+          final int batch = (int) Math.min(remaining, MAX_PRESENT_BATCH);
+          result += present.nextVector(null, null, 0, batch);
+          remaining -= batch;
         }
         return result;
       } else {
@@ -362,32 +372,42 @@ public class TreeReaderFactory {
                            ReadPhase readPhase) throws IOException {
       if (present != null || isNull != null) {
         // Set noNulls and isNull vector of the ColumnVector based on
-        // present stream
-        previous.noNulls = true;
-        boolean allNull = true;
-        for (int i = 0; i < batchSize; i++) {
-          if (isNull == null || !isNull[i]) {
-            if (present != null && present.next() != 1) {
-              previous.noNulls = false;
-              previous.isNull[i] = true;
-            } else {
-              previous.isNull[i] = false;
-              allNull = false;
-            }
-          } else {
-            previous.noNulls = false;
-            previous.isNull[i] = true;
-          }
+        // present stream. The present stream is consumed for every row, even
+        // when the vector was previously marked as having no nulls.
+        final long nonNulls;
+        if (present != null) {
+          nonNulls = present.nextVector(previous.isNull, isNull, 0, batchSize);
+        } else {
+          // There is no present stream, so the nulls come from the parent.
+          nonNulls = countNonNullRows(isNull, batchSize);
+          // The rows that the parent has marked as null are null here too.
+          System.arraycopy(isNull, 0, previous.isNull, 0, batchSize);
         }
-        previous.isRepeating = !previous.noNulls && allNull;
+        previous.noNulls = nonNulls == batchSize;
+        previous.isRepeating = !previous.noNulls && nonNulls == 0;
       } else {
         // There is no present stream, this means that all the values are
         // present.
         previous.noNulls = true;
-        for (int i = 0; i < batchSize; i++) {
-          previous.isNull[i] = false;
+        Arrays.fill(previous.isNull, 0, batchSize, false);
+      }
+    }
+
+    /**
+     * Count the rows of the batch that are not null in the parent vector.
+     *
+     * @param isNull the null flags of the parent vector
+     * @param batchSize the number of rows in the batch
+     * @return the number of rows where the parent is not null
+     */
+    private static long countNonNullRows(boolean[] isNull, int batchSize) {
+      long result = 0;
+      for (int i = 0; i < batchSize; ++i) {
+        if (!isNull[i]) {
+          result += 1;
         }
       }
+      return result;
     }
 
     public BitFieldReader getPresent() {
@@ -1033,14 +1053,17 @@ public class TreeReaderFactory {
           }
         } else {
           // no nulls
+          // The values of a dense batch are contiguous on the stream, so read
+          // them all in one bulk read instead of one read per value.
+          // A degenerate batch (batchSize > vector.length) only reads a single
+          // value, as the original per-value loop did.
+          final int count = (batchSize > 1 && batchSize > result.vector.length) ?
+              1 : batchSize;
+          utils.readDoubles(stream, result.vector, 0, count);
           boolean repeating = (batchSize > 1);
-          final double d1 = utils.readDouble(stream);
-          result.vector[0] = d1;
-          // conditions to ensure bounds checks skips
-          for (int i = 1; i < batchSize && batchSize <= result.vector.length; i++) {
-            final double d2 = utils.readDouble(stream);
-            repeating = repeating && (d1 == d2);
-            result.vector[i] = d2;
+          final double d1 = result.vector[0];
+          for (int i = 1; i < count; i++) {
+            repeating = repeating && (d1 == result.vector[i]);
           }
           result.isRepeating = repeating;
         }

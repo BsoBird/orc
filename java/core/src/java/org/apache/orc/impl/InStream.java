@@ -196,6 +196,56 @@ public abstract class InStream extends InputStream {
       return (int) (length - position);
     }
 
+    /**
+     * Skip over the given number of bytes without copying them.
+     *
+     * The bytes are consumed from the currently decrypted range and the
+     * stream moves to the next range(s) only when the current one is
+     * exhausted. This is equivalent to (but much cheaper than) the default
+     * {@link InputStream#skip(long)} implementation, which reads the bytes
+     * one at a time.
+     *
+     * @param requested the number of bytes to skip
+     * @return the number of bytes actually skipped, which is less than
+     *         requested only if the end of the stream was reached
+     * @throws IOException if the stream claims to be longer than the ranges
+     *         that back it, so the rest of it can't be skipped
+     */
+    @Override
+    public long skip(long requested) throws IOException {
+      if (requested <= 0) {
+        return 0;
+      }
+      long skipped = 0;
+      while (skipped < requested) {
+        if (decrypted == null || decrypted.remaining() == 0) {
+          if (position >= length) {
+            // The end of the stream is a short read, not an error.
+            break;
+          }
+          final DiskRangeList nextRange =
+              currentRange == null ? null : currentRange.next;
+          if (nextRange == null) {
+            // There is data left in the stream, but the ranges have run out,
+            // so this stream is truncated or malformed. Fail here, rather than
+            // returning a short count that would leave the callers spinning
+            // while they try to skip the rest of the data.
+            throw new IOException("Unable to skip " + name + " past position " +
+                (position + (requested - skipped)) +
+                " because its ranges end at " +
+                position + ", but the stream is " + length + " bytes long");
+          }
+          setCurrent(nextRange, false);
+          continue;
+        }
+        final long actual = Math.min(decrypted.remaining(), requested - skipped);
+        decrypted.position(decrypted.position() + (int) actual);
+        position += actual;
+        skipped += actual;
+      }
+      return skipped;
+    }
+
     @Override
     public void close() {
       currentRange = null;
@@ -556,6 +606,64 @@ public abstract class InStream extends InputStream {
         return 0;
       }
       return uncompressed.remaining();
+    }
+
+    /**
+     * Skip over the given number of uncompressed bytes without copying them.
+     *
+     * The bytes are dropped from the currently decompressed chunk and the
+     * next chunk is only read when the current one is exhausted. This is
+     * equivalent to (but much cheaper than) the default
+     * {@link InputStream#skip(long)} implementation, which reads the bytes
+     * one at a time.
+     *
+     * @param requested the number of uncompressed bytes to skip
+     * @return the number of bytes actually skipped, which is less than
+     *         requested only if the end of the stream was reached
+     * @throws IOException if the stream claims to be longer than the ranges
+     *         that back it, so the rest of it can't be skipped
+     */
+    @Override
+    public long skip(long requested) throws IOException {
+      if (requested <= 0) {
+        return 0;
+      }
+      long skipped = 0;
+      while (skipped < requested) {
+        if (uncompressed == null || uncompressed.remaining() == 0) {
+          if (!ensureUncompressedForSkip()) {
+            break;
+          }
+          continue;
+        }
+        final long actual =
+            Math.min(uncompressed.remaining(), requested - skipped);
+        uncompressed.position(uncompressed.position() + (int) actual);
+        skipped += actual;
+      }
+      return skipped;
+    }
+
+    /**
+     * Read the next compressed chunk, reporting the case where the ranges run
+     * out in the middle of its header as an {@link IOException}, so that it
+     * matches what an uncompressed stream does. The {@link IllegalStateException}
+     * that {@link #readHeaderByte()} throws is unchecked, which leaves the
+     * callers of skip unable to handle a truncated stream the way that they
+     * handle any other failure to read the data.
+     *
+     * @return false if the end of the stream was reached
+     */
+    private boolean ensureUncompressedForSkip() throws IOException {
+      try {
+        return ensureUncompressed();
+      } catch (IllegalStateException e) {
+        final IOException failure = new IOException("Unable to skip " + name +
+            " because its compressed data ends at " + position +
+            ", but the stream is " + length + " bytes long");
+        failure.initCause(e);
+        throw failure;
+      }
     }
 
     @Override

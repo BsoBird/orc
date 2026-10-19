@@ -21,9 +21,13 @@ import org.apache.orc.CompressionCodec;
 import org.apache.orc.impl.writer.StreamOptions;
 import org.junit.jupiter.api.Test;
 
+import java.io.EOFException;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class TestRunLengthByteReader {
 
@@ -143,5 +147,88 @@ public class TestRunLengthByteReader {
       }
       in.skip(0);
     }
+  }
+
+  /**
+   * Write the COUNT values used by the nextBytes tests and check that reading
+   * them in bulk gives the same values as reading them one at a time.
+   */
+  private static byte[] nextBytesExpected(int count) {
+    byte[] expected = new byte[count];
+    for (int i = 0; i < count; ++i) {
+      expected[i] = (byte) (i < count / 2 ? (i / 4) : i);
+    }
+    return expected;
+  }
+
+  private static void checkNextBytes(RunLengthByteReader in, byte[] expected)
+      throws Exception {
+    // Read the values with batches that span the runs, the repeat to
+    // literal boundary and the buffer flushes.
+    byte[] buffer = new byte[expected.length + 8];
+    int posn = 0;
+    for (int size : new int[]{0, 1, 7, 8, 3, 1000, 9,
+        expected.length - 1028}) {
+      // alternate the offset so that the results are checked in place
+      final int offset = (posn % 3) * 2;
+      assertEquals(size, in.nextBytes(buffer, offset, size),
+          "nextBytes(" + size + ") at " + posn);
+      assertArrayEquals(Arrays.copyOfRange(expected, posn, posn + size),
+          Arrays.copyOfRange(buffer, offset, offset + size),
+          "values at " + posn);
+      posn += size;
+    }
+    assertEquals(expected.length, posn);
+    // nothing is left, so a zero length read succeeds and a real read fails
+    assertEquals(0, in.nextBytes(buffer, 0, 0));
+    assertThrows(EOFException.class, () -> in.nextBytes(buffer, 0, 1));
+  }
+
+  @Test
+  public void testNextBytesUncompressed() throws Exception {
+    final int COUNT = 2048;
+    TestInStream.OutputCollector collect = new TestInStream.OutputCollector();
+    RunLengthByteWriter out = new RunLengthByteWriter(new OutStream("test",
+        new StreamOptions(100), collect));
+    for (int i = 0; i < COUNT; ++i) {
+      if (i < COUNT / 2) {
+        out.write((byte) (i / 4));
+      } else {
+        out.write((byte) i);
+      }
+    }
+    out.flush();
+    ByteBuffer inBuf = ByteBuffer.allocate(collect.buffer.size());
+    collect.buffer.setByteBuffer(inBuf, 0, collect.buffer.size());
+    inBuf.flip();
+    checkNextBytes(new RunLengthByteReader(InStream.create("test",
+        new BufferChunk(inBuf, 0), 0, inBuf.remaining())),
+        nextBytesExpected(COUNT));
+  }
+
+  @Test
+  public void testNextBytesCompressed() throws Exception {
+    final int COUNT = 2048;
+    CompressionCodec codec = new ZlibCodec();
+    StreamOptions options = new StreamOptions(100)
+        .withCodec(codec, codec.getDefaultOptions());
+    TestInStream.OutputCollector collect = new TestInStream.OutputCollector();
+    RunLengthByteWriter out = new RunLengthByteWriter(
+        new OutStream("test", options, collect));
+    for (int i = 0; i < COUNT; ++i) {
+      if (i < COUNT / 2) {
+        out.write((byte) (i / 4));
+      } else {
+        out.write((byte) i);
+      }
+    }
+    out.flush();
+    ByteBuffer inBuf = ByteBuffer.allocate(collect.buffer.size());
+    collect.buffer.setByteBuffer(inBuf, 0, collect.buffer.size());
+    inBuf.flip();
+    checkNextBytes(new RunLengthByteReader(InStream.create("test",
+        new BufferChunk(inBuf, 0), 0, inBuf.remaining(),
+        InStream.options().withCodec(codec).withBufferSize(100))),
+        nextBytesExpected(COUNT));
   }
 }

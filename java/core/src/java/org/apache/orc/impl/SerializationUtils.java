@@ -40,8 +40,24 @@ public final class SerializationUtils {
   private static final Logger LOG = LoggerFactory.getLogger(SerializationUtils.class);
 
   private static final int BUFFER_SIZE = 64;
+
+  /**
+   * The most bytes that a bulk read holds in the scratch buffer at once.
+   * Larger batches are read in chunks of this size, so that the retained
+   * buffer stays small no matter how many values are read at once.
+   *
+   * @see BitFieldReader
+   */
+  private static final int MAX_BULK_BYTES = 1 << 13;
   private final byte[] readBuffer;
   private final byte[] writeBuffer;
+
+  /**
+   * Reusable scratch buffer for bulk reads. It is grown on demand, up to
+   * {@link #MAX_BULK_BYTES}, and kept between calls so that reading a batch of
+   * values doesn't allocate.
+   */
+  private byte[] bulkReadBuffer;
 
   /**
    * Buffer for histogram that store the encoded bit requirement for each bit
@@ -125,6 +141,78 @@ public final class SerializationUtils {
     return Double.longBitsToDouble(readLongLE(in));
   }
 
+  /**
+   * Read a batch of little-endian doubles from the stream in bulk.
+   *
+   * <p>This is equivalent to calling {@link #readDouble(InputStream)}
+   * {@code count} times, including for partial reads at the boundaries of the
+   * buffered ranges of the stream, but it copies the bytes with a single bulk
+   * read and decodes them from a scratch buffer that is reused between the
+   * calls, so that no memory is allocated per batch. Batches that need more
+   * than {@link #MAX_BULK_BYTES} bytes are read in chunks of that size, so
+   * that the retained buffer never grows past it.</p>
+   *
+   * @param in the stream to read the values from
+   * @param values the array that the values are read into
+   * @param offset the first index of values to be filled in
+   * @param count the number of doubles to read, where a count of zero or less
+   *          reads nothing
+   * @throws IOException if the stream doesn't have the requested values, in
+   *         which case the values that were read before the end of the stream
+   *         have been set
+   * @throws IllegalArgumentException if the count is so large that the bytes
+   *         of the values don't fit in an int
+   * @throws IndexOutOfBoundsException if the values don't fit in the array
+   */
+  public void readDoubles(InputStream in, double[] values, int offset, int count)
+      throws IOException {
+    if (count <= 0) {
+      // A loop of readDouble calls reads nothing, so there is nothing to do.
+      return;
+    }
+    if (count > (Integer.MAX_VALUE - 7) / 8) {
+      throw new IllegalArgumentException("Cannot read " + count +
+          " doubles, because " + count + " * 8 bytes overflows an int");
+    }
+    if (offset < 0 || offset > values.length || count > values.length - offset) {
+      throw new IndexOutOfBoundsException("Reading " + count + " doubles at " +
+          offset + " doesn't fit in an array of " + values.length);
+    }
+    final int chunkCount = MAX_BULK_BYTES / 8;
+    int posn = offset;
+    for (int remaining = count; remaining > 0; ) {
+      // Read at most MAX_BULK_BYTES at a time, so that a huge batch doesn't
+      // allocate a buffer for all of its bytes.
+      final int toRead = Math.min(remaining, chunkCount);
+      final int bytes = toRead * 8;
+      if (bulkReadBuffer == null || bulkReadBuffer.length < bytes) {
+        bulkReadBuffer = new byte[bytes];
+      }
+      final int read = readFully(in, bulkReadBuffer, 0, bytes);
+      // Decode the values that did arrive before checking for the end of the
+      // stream, so that a batch that ends mid-chunk still sets the values
+      // that the stream had.
+      int idx = 0;
+      for (int i = 0; i < read / 8; ++i) {
+        values[posn + i] = Double.longBitsToDouble(
+            ((long) (bulkReadBuffer[idx] & 0xff))
+                | ((long) (bulkReadBuffer[idx + 1] & 0xff) << 8)
+                | ((long) (bulkReadBuffer[idx + 2] & 0xff) << 16)
+                | ((long) (bulkReadBuffer[idx + 3] & 0xff) << 24)
+                | ((long) (bulkReadBuffer[idx + 4] & 0xff) << 32)
+                | ((long) (bulkReadBuffer[idx + 5] & 0xff) << 40)
+                | ((long) (bulkReadBuffer[idx + 6] & 0xff) << 48)
+                | ((long) (bulkReadBuffer[idx + 7] & 0xff) << 56));
+        idx += 8;
+      }
+      posn += read / 8;
+      remaining -= read / 8;
+      if (read != bytes) {
+        throw new EOFException("Read past EOF for " + in);
+      }
+    }
+  }
+
   public long readLongLE(InputStream in) throws IOException {
     readFully(in, readBuffer, 8);
     return (((readBuffer[0] & 0xff) << 0)
@@ -139,18 +227,33 @@ public final class SerializationUtils {
 
   private void readFully(final InputStream in, final byte[] buffer, int len)
       throws IOException {
-    int offset = 0;
-    for (;;) {
-      final int n = in.read(buffer, offset, len);
-      if (n == len) {
-        return;
-      }
+    if (readFully(in, buffer, 0, len) != len) {
+      throw new EOFException("Read past EOF for " + in);
+    }
+  }
+
+  /**
+   * Fill the buffer from the given offset with up to the given number of
+   * bytes.
+   *
+   * @param in the stream to read the bytes from
+   * @param buffer the buffer to fill in
+   * @param offset the first index of the buffer to fill in
+   * @param len the number of bytes to read
+   * @return the offset of the first byte that the stream didn't have, which is
+   *          offset + len if all of the bytes were read
+   */
+  private int readFully(final InputStream in, final byte[] buffer, int offset,
+                        int len) throws IOException {
+    final int end = offset + len;
+    while (offset < end) {
+      final int n = in.read(buffer, offset, end - offset);
       if (n < 0) {
-        throw new EOFException("Read past EOF for " + in);
+        return offset;
       }
       offset += n;
-      len -= n;
     }
+    return offset;
   }
 
   public void skipDouble(InputStream in, int numOfDoubles) throws IOException {

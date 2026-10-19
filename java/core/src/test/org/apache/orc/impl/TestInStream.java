@@ -40,6 +40,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 public class TestInStream {
@@ -999,5 +1001,428 @@ public class TestInStream {
     // Reading the stream and expecting to read 5 bytes as the initial stream length
     byte[] inBuffer = new byte[5];
     assertEquals(5, inStream.read(inBuffer));
+  }
+
+  /**
+   * Set up a stream of STREAM_LENGTH bytes that are split into chunks of
+   * CHUNK_LENGTH, so that reads and skips have to move between the chunks.
+   */
+  private static BufferChunkList chunkedBytes(long start, int chunkLength,
+                                             byte[] data) {
+    BufferChunkList list = new BufferChunkList();
+    int posn = 0;
+    while (posn < data.length) {
+      list.add(new BufferChunk(
+          ByteBuffer.wrap(data, posn,
+              Math.min(chunkLength, data.length - posn)),
+          start + posn));
+      posn += chunkLength;
+    }
+    return list;
+  }
+
+  private static byte[] numbered(int length) {
+    byte[] result = new byte[length];
+    for (int i = 0; i < length; ++i) {
+      result[i] = (byte) i;
+    }
+    return result;
+  }
+
+  /**
+   * Check that skipping to each of the positions gives the same values as
+   * reading the bytes one at a time. Skips that run past the end of the data
+   * should stop at the end.
+   */
+  private static void checkSkips(InStream stream, byte[] data, int[] skips)
+      throws IOException {
+    long position = 0;
+    for (int skip : skips) {
+      final long target = Math.min(position + skip, data.length);
+      final long skipped = stream.skip(skip);
+      assertEquals(target, position + skipped,
+          "skip(" + skip + ") at " + position);
+      final int end = (int) Math.min(target + 3, data.length);
+      for (long i = target; i < end; ++i) {
+        assertEquals(data[(int) i], (byte) stream.read(),
+            "read at " + i);
+      }
+      position = end;
+    }
+  }
+
+  @Test
+  public void testUncompressedSkipSingleRange() throws IOException {
+    final int LENGTH = 1024;
+    byte[] data = numbered(LENGTH);
+    try (InStream stream = InStream.create("test",
+        new BufferChunk(ByteBuffer.wrap(data), 0), 0, LENGTH,
+        InStream.options())) {
+      assertEquals(0, stream.skip(0));
+      assertEquals(0, stream.skip(-1));
+      checkSkips(stream, data, new int[]{1, 7, 0, 8, 100, 13, LENGTH + 100});
+      assertEquals(0, stream.skip(10));
+      assertEquals(-1, stream.read());
+    }
+  }
+
+  @Test
+  public void testUncompressedSkipMultiRange() throws IOException {
+    // Skip over the chunk boundaries as well as the end of the stream.
+    final long START = 1_000_000_000;
+    final int CHUNK_LENGTH = 100;
+    final int LENGTH = 4096;
+    byte[] data = numbered(LENGTH);
+    try (InStream stream = InStream.create("test",
+        chunkedBytes(START, CHUNK_LENGTH, data).get(), START, LENGTH,
+        InStream.options())) {
+      checkSkips(stream, data, new int[]{
+          99, 1, 100, 250, 0, 7, 8, 1000, 64, 33, LENGTH, 1});
+      assertEquals(0, stream.skip(1));
+    }
+  }
+
+  /**
+   * A stream that is longer than the ranges that back it is truncated or
+   * malformed, so the skip has to fail rather than return a short count,
+   * which would leave the callers spinning while they try to skip the rest
+   * of the data.
+   */
+  @Test
+  public void testUncompressedSkipTruncatedRanges() throws IOException {
+    final int LENGTH = 4096;
+    byte[] data = numbered(LENGTH);
+    try (InStream stream = InStream.create("test",
+        new BufferChunk(ByteBuffer.wrap(data), 0), 0, 2 * LENGTH,
+        InStream.options())) {
+      // The data that the ranges hold can be skipped.
+      assertEquals(LENGTH, stream.skip(LENGTH));
+      assertEquals(0, stream.skip(0));
+      // but the rest of the stream is missing.
+      IOException e = assertThrows(IOException.class, () -> stream.skip(1));
+      assertEquals("Unable to skip test past position " + (LENGTH + 1) +
+              " because its ranges end at " + LENGTH + ", but the stream is " +
+              (2 * LENGTH) + " bytes long", e.getMessage());
+      // the failed skip didn't move the stream, so it fails the same way.
+      assertThrows(IOException.class, () -> stream.skip(2 * LENGTH));
+    }
+  }
+
+  /**
+   * When the ranges of a truncated stream run out part way through a skip, the
+   * position that the message gives is the end of the whole request, not the
+   * end of the request plus the bytes that this call already skipped.
+   */
+  @Test
+  public void testUncompressedSkipTruncatedMultiRange() throws IOException {
+    final long START = 1_000_000_000;
+    final int CHUNK_LENGTH = 100;
+    final int LENGTH = 4096;
+    byte[] data = numbered(LENGTH);
+    try (InStream stream = InStream.create("test",
+        chunkedBytes(START, CHUNK_LENGTH, data).get(), START, 2 * LENGTH,
+        InStream.options())) {
+      // skip over the range boundaries to get into the middle of the data
+      assertEquals(250, stream.skip(250));
+      // this call skips the rest of the ranges and then runs out of them
+      IOException e = assertThrows(IOException.class, () -> stream.skip(4000));
+      assertEquals("Unable to skip test past position 4250 because its " +
+              "ranges end at 4096, but the stream is " + (2 * LENGTH) +
+              " bytes long", e.getMessage());
+      // the skip consumed all of the data that the ranges held, so the next
+      // one fails at the place that it starts from
+      assertEquals("Unable to skip test past position 4097 because its " +
+              "ranges end at 4096, but the stream is " + (2 * LENGTH) +
+              " bytes long",
+          assertThrows(IOException.class, () -> stream.skip(1)).getMessage());
+    }
+  }
+
+  /**
+   * A stream that has lost the range that it is reading from can't be skipped
+   * either.
+   */
+  @Test
+  public void testUncompressedSkipLostRange() throws IOException {
+    final int LENGTH = 128;
+    LostRangeStream stream = new LostRangeStream(numbered(LENGTH), 2 * LENGTH);
+    assertEquals(LENGTH, stream.skip(LENGTH));
+    stream.dropRange();
+    assertThrows(IOException.class, () -> stream.skip(1));
+    stream.close();
+    // the end of the stream is a short read, not an error
+    assertEquals(0, stream.skip(1));
+  }
+
+  /**
+   * An uncompressed stream that has run out of ranges.
+   */
+  private static class LostRangeStream extends InStream.UncompressedStream {
+    LostRangeStream(byte[] data, long length) {
+      super("test", new BufferChunk(ByteBuffer.wrap(data), 0), 0, length);
+    }
+
+    void dropRange() {
+      currentRange = null;
+    }
+  }
+
+  @Test
+  public void testUncompressedSkipThenSeek() throws IOException {
+    PositionCollector[] positions = new PositionCollector[1024];
+    byte[] bytes = getUncompressed(positions);
+    try (InStream stream = InStream.create("test",
+        chunkedBytes(0, 100, bytes).get(), 0, 1024, InStream.options())) {
+      // skip forward and check that the read picks up at the new position
+      assertEquals(500, stream.skip(500));
+      assertEquals(500 & 0xff, stream.read());
+      // seeking back and forth over the ranges still gives the right bytes
+      for (int i = 1023; i >= 0; --i) {
+        stream.seek(positions[i]);
+        assertEquals(i & 0xff, stream.read(), "value " + i);
+      }
+    }
+    checkUncompressedSkipAfterSeek();
+  }
+
+  /**
+   * Each position can only be seeked to once, so check the seeks that come
+   * after a skip with a fresh set of them.
+   */
+  private void checkUncompressedSkipAfterSeek() throws IOException {
+    PositionCollector[] positions = new PositionCollector[1024];
+    byte[] bytes = getUncompressed(positions);
+    try (InStream stream = InStream.create("test",
+        chunkedBytes(0, 100, bytes).get(), 0, 1024, InStream.options())) {
+      stream.seek(positions[400]);
+      assertEquals(400 & 0xff, stream.read());
+      assertEquals(200, stream.skip(200));
+      assertEquals(601 & 0xff, stream.read());
+      // skipping over the last byte still hits the end of the stream
+      assertEquals(422, stream.skip(1024));
+      assertEquals(0, stream.skip(1));
+      assertEquals(-1, stream.read());
+    }
+  }
+
+  @Test
+  public void testCompressedSkipThenSeek() throws IOException {
+    PositionCollector[] positions = new PositionCollector[1024];
+    byte[] bytes = getCompressed(positions);
+    try (InStream stream = InStream.create("test",
+        new BufferChunk(ByteBuffer.wrap(bytes), 0), 0, bytes.length,
+        InStream.options().withCodec(new ZlibCodec()).withBufferSize(300))) {
+      assertEquals(500, stream.skip(500));
+      assertEquals(500 & 0xff, stream.read());
+      for (int i = 1023; i >= 0; --i) {
+        stream.seek(positions[i]);
+        assertEquals(i & 0xff, stream.read(), "value " + i);
+      }
+    }
+    checkCompressedSkipAfterSeek();
+  }
+
+  private void checkCompressedSkipAfterSeek() throws IOException {
+    PositionCollector[] positions = new PositionCollector[1024];
+    byte[] bytes = getCompressed(positions);
+    try (InStream stream = InStream.create("test",
+        new BufferChunk(ByteBuffer.wrap(bytes), 0), 0, bytes.length,
+        InStream.options().withCodec(new ZlibCodec()).withBufferSize(300))) {
+      stream.seek(positions[400]);
+      assertEquals(400 & 0xff, stream.read());
+      assertEquals(200, stream.skip(200));
+      assertEquals(601 & 0xff, stream.read());
+      assertEquals(422, stream.skip(1024));
+      assertEquals(0, stream.skip(1));
+      assertEquals(-1, stream.read());
+    }
+  }
+
+  /**
+   * Get a compressed stream of numbered bytes, where the small buffer size
+   * ensures that there are many compressed chunks to read.
+   */
+  private static byte[] compressNumbered(int length, int bufferSize)
+      throws IOException {
+    CompressionCodec codec = new ZlibCodec();
+    StreamOptions options = new StreamOptions(bufferSize)
+        .withCodec(codec, codec.getDefaultOptions());
+    OutputCollector collect = new OutputCollector();
+    try (OutStream out = new OutStream("test", options, collect)) {
+      for (int i = 0; i < length; ++i) {
+        out.write(i);
+      }
+      out.flush();
+    }
+    return collect.buffer.get();
+  }
+
+  @Test
+  public void testCompressedSkipSingleRange() throws IOException {
+    final int LENGTH = 4096;
+    byte[] data = numbered(LENGTH);
+    byte[] compressed = compressNumbered(LENGTH, 300);
+    try (InStream stream = InStream.create("test",
+        new BufferChunk(ByteBuffer.wrap(compressed), 0), 0, compressed.length,
+        InStream.options().withCodec(new ZlibCodec()).withBufferSize(300))) {
+      checkSkips(stream, data, new int[]{
+          1, 7, 0, 8, 255, 100, 300, 256, 13, LENGTH + 100});
+      assertEquals(0, stream.skip(1));
+      assertEquals(-1, stream.read());
+    }
+  }
+
+  @Test
+  public void testCompressedSkipMultiRange() throws IOException {
+    // The compressed chunks are split over many disk ranges, so the skip has
+    // to read and decompress several chunks to satisfy it.
+    final long START = 1_000_000_000;
+    final int CHUNK_LENGTH = 25;
+    final int LENGTH = 4096;
+    byte[] data = numbered(LENGTH);
+    byte[] compressed = compressNumbered(LENGTH, 300);
+    try (InStream stream = InStream.create("test",
+        chunkedBytes(START, CHUNK_LENGTH, compressed).get(), START,
+        compressed.length,
+        InStream.options().withCodec(new ZlibCodec()).withBufferSize(300))) {
+      checkSkips(stream, data, new int[]{
+          24, 1, 100, 300, 7, 8, 256, 1000, 13, LENGTH + 100});
+      assertEquals(0, stream.skip(1));
+    }
+  }
+
+  /**
+   * A compressed stream that is longer than the ranges that back it can't
+   * finish a skip, so the skip fails with a checked exception, the same way
+   * that an uncompressed stream does, rather than with the unchecked exception
+   * that the header reader throws.
+   */
+  @Test
+  public void testCompressedSkipTruncatedRanges() throws IOException {
+    final int LENGTH = 4096;
+    final int BUFFER_SIZE = 300;
+    byte[] compressed = compressNumbered(LENGTH, BUFFER_SIZE);
+    // Cut the compressed data at the header of the third chunk, so that the
+    // chunks that the ranges hold are complete, but the header of the next one
+    // is missing.
+    final int cut = chunkHeaderOffset(compressed, 2, BUFFER_SIZE);
+    try (InStream stream = InStream.create("test",
+        chunkedBytes(0, 64, Arrays.copyOf(compressed, cut)).get(), 0,
+        compressed.length,
+        InStream.options().withCodec(new ZlibCodec())
+            .withBufferSize(BUFFER_SIZE))) {
+      // The two chunks that the ranges hold can be skipped.
+      assertEquals(2 * BUFFER_SIZE, stream.skip(2 * BUFFER_SIZE));
+      // but the stream still claims to have more data in it.
+      IOException e = assertThrows(IOException.class, () -> stream.skip(1));
+      assertEquals("Unable to skip test because its compressed data ends at " +
+          cut + ", but the stream is " + compressed.length + " bytes long",
+          e.getMessage());
+      assertTrue(e.getCause() instanceof IllegalStateException,
+          "cause: " + e.getCause());
+      // the same skip fails the same way the second time
+      assertThrows(IOException.class, () -> stream.skip(1024));
+    }
+  }
+
+  /**
+   * Find the offset of the header of the given chunk in the compressed data,
+   * so that the data can be cut at a chunk boundary.
+   *
+   * @param compressed the compressed stream
+   * @param chunk the number of the chunk to find
+   * @param bufferSize the size of the uncompressed chunks
+   * @return the offset of the chunk's header
+   */
+  private static int chunkHeaderOffset(byte[] compressed, int chunk,
+                                       int bufferSize) {
+    int posn = 0;
+    for (int found = 0; ; ++found) {
+      if (found == chunk) {
+        return posn;
+      }
+      if (posn + 3 > compressed.length) {
+        throw new IllegalArgumentException("Only found " + found +
+            " chunks in " + compressed.length + " bytes");
+      }
+      final int b0 = compressed[posn] & 0xff;
+      final int b1 = compressed[posn + 1] & 0xff;
+      final int b2 = compressed[posn + 2] & 0xff;
+      final int chunkLength = (b2 << 15) | (b1 << 7) | (b0 >> 1);
+      if (chunkLength <= 0 || chunkLength > bufferSize) {
+        throw new IllegalArgumentException("Chunk at " + posn +
+            " has a length of " + chunkLength + " bytes");
+      }
+      posn += 3 + chunkLength;
+    }
+  }
+
+  @Test
+  public void testEncryptedSkip() throws IOException {
+    final long DATA_CONST = 0x1_0000_0003L;
+    final int ROW_COUNT = 1024;
+    PositionCollector[] positions = new PositionCollector[ROW_COUNT];
+    EncryptionAlgorithm algorithm = EncryptionAlgorithm.AES_CTR_128;
+    byte[] rawKey = new byte[algorithm.keyLength()];
+    byte[] iv = new byte[algorithm.getIvLength()];
+    byte[] bytes = getEncrypted(positions, rawKey, iv, algorithm, ROW_COUNT,
+        DATA_CONST);
+    // The ranges are not aligned with the 16 byte aes blocks.
+    BufferChunkList list = new BufferChunkList();
+    int offset = 0;
+    for (int size : new int[]{1965, 13, ROW_COUNT * 8 - 1965 - 13}) {
+      ByteBuffer buffer = ByteBuffer.allocate(size);
+      buffer.put(bytes, offset, size);
+      buffer.flip();
+      list.add(new BufferChunk(buffer, offset));
+      offset += size;
+    }
+    try (InStream stream = InStream.create("test", list.get(), 0, bytes.length,
+        InStream.options().withEncryption(algorithm,
+            new SecretKeySpec(rawKey, algorithm.getAlgorithm()), iv));
+         DataInputStream input = new DataInputStream(stream)) {
+      // Skip rows and check that the values line up with the row numbers.
+      assertEquals(0, stream.skip(0));
+      assertEquals(1968, stream.skip(1968));
+      assertEquals(246 * DATA_CONST, input.readLong());
+      assertEquals(3 * 8, stream.skip(3 * 8));
+      assertEquals(250 * DATA_CONST, input.readLong());
+      assertEquals(bytes.length - 2008, stream.skip(bytes.length * 2L));
+      assertEquals(0, stream.skip(8));
+    }
+  }
+
+  @Test
+  public void testCompressedEncryptedSkip() throws IOException {
+    final long DATA_CONST = 0x1_0000_0003L;
+    final int ROW_COUNT = 1024;
+    EncryptionAlgorithm algorithm = EncryptionAlgorithm.AES_CTR_128;
+    byte[] key = new byte[algorithm.keyLength()];
+    byte[] iv = new byte[algorithm.getIvLength()];
+    byte[] bytes = getCompressedEncrypted(key, iv,
+        new PositionCollector[ROW_COUNT], algorithm, ROW_COUNT, DATA_CONST);
+    // The compressed chunks are split over several disk ranges.
+    BufferChunkList list = new BufferChunkList();
+    int offset = 0;
+    for (int size : new int[]{1998, 7, bytes.length - 1998 - 7}) {
+      ByteBuffer buffer = ByteBuffer.allocate(size);
+      buffer.put(bytes, offset, size);
+      buffer.flip();
+      list.add(new BufferChunk(buffer, offset));
+      offset += size;
+    }
+    try (InStream stream = InStream.create("test", list.get(), 0, bytes.length,
+        InStream.options().withCodec(new ZlibCodec()).withBufferSize(500)
+            .withEncryption(algorithm,
+                new SecretKeySpec(key, algorithm.getAlgorithm()), iv));
+         DataInputStream input = new DataInputStream(stream)) {
+      assertEquals(0, stream.skip(0));
+      assertEquals(800, stream.skip(800));
+      assertEquals(100 * DATA_CONST, input.readLong());
+      assertEquals(100 * 8, stream.skip(100 * 8));
+      assertEquals(201 * DATA_CONST, input.readLong());
+      assertEquals(ROW_COUNT * 8 - 1616, stream.skip(ROW_COUNT * 8));
+      assertEquals(0, stream.skip(8));
+    }
   }
 }
