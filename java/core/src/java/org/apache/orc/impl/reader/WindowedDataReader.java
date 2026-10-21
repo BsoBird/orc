@@ -84,7 +84,11 @@ import java.util.Map;
  */
 public class WindowedDataReader implements DataReader {
 
-  private final DataReader delegate;
+  /**
+   * The reader this decorator sits on. Not final: a clone owns a clone of it,
+   * so that the two never share a file handle.
+   */
+  private DataReader delegate;
   private final WindowedReadConfig config;
   private final WindowedScanContext context;
 
@@ -97,9 +101,9 @@ public class WindowedDataReader implements DataReader {
 
   // ---- lazily built plan (pure arithmetic over StripeInformation) ----
   private boolean planned;
-  private final List<Window> windows = new ArrayList<>();
+  private List<Window> windows = new ArrayList<>();
   /** Stripe id to window. The id is file-wide; the stripe list may be filtered. */
-  private final Map<Long, Integer> windowOfStripe = new HashMap<>();
+  private Map<Long, Integer> windowOfStripe = new HashMap<>();
 
   /** The window whose bytes are currently resident, or {@code null}. */
   private Window resident;
@@ -115,6 +119,8 @@ public class WindowedDataReader implements DataReader {
   private long servedBytes;
   private long missedChunks;
   private long missedBytes;
+  private long speculatedBytes;
+  private double savedRoundTrips;
   private String lastGateReason = "not-planned";
 
   public WindowedDataReader(DataReader delegate,
@@ -200,9 +206,41 @@ public class WindowedDataReader implements DataReader {
     return missedBytes;
   }
 
+  /**
+   * Bytes the engaged windows read beyond what the scan asked for: the price
+   * of merging the requests.
+   */
+  public long getSpeculatedBytes() {
+    return speculatedBytes;
+  }
+
+  /**
+   * Round trips the gate credited the engaged windows with, in total.
+   */
+  public double getSavedRoundTrips() {
+    return savedRoundTrips;
+  }
+
   /** Why the gate last said no, for diagnostics. */
   public String getLastGateReason() {
     return lastGateReason;
+  }
+
+  /** Zero every counter, so that a clone starts from a clean slate. */
+  private void resetCounters() {
+    windowsEngaged = 0;
+    windowsStoodDown = 0;
+    roundOneRequests = 0;
+    roundTwoRequests = 0;
+    roundOneRanges = 0;
+    roundTwoRanges = 0;
+    servedChunks = 0;
+    servedBytes = 0;
+    missedChunks = 0;
+    missedBytes = 0;
+    speculatedBytes = 0;
+    savedRoundTrips = 0;
+    lastGateReason = "not-planned";
   }
 
   // ------------------------------------------------------------------
@@ -298,9 +336,31 @@ public class WindowedDataReader implements DataReader {
     delegate.releaseAllBuffers();
   }
 
+  /**
+   * Clone the reader.
+   *
+   * <p>The copy owns a clone of the delegate, so that the two never share a
+   * file handle, and it starts with no plan of its own: the plan is pure
+   * arithmetic over the stripes, so the copy builds its own the first time it
+   * is asked for a window. It deliberately does not inherit the template
+   * planner, whose scratch planners read their index bytes through the reader
+   * that owns them.</p>
+   */
   @Override
   public DataReader clone() {
-    return new WindowedDataReader(delegate.clone(), config, context);
+    try {
+      WindowedDataReader copy = (WindowedDataReader) super.clone();
+      copy.delegate = delegate.clone();
+      copy.templatePlanner = null;
+      copy.windows = new ArrayList<>();
+      copy.windowOfStripe = new HashMap<>();
+      copy.planned = false;
+      copy.resident = null;
+      copy.resetCounters();
+      return copy;
+    } catch (CloneNotSupportedException e) {
+      throw new UnsupportedOperationException("uncloneable", e);
+    }
   }
 
   @Override
@@ -480,9 +540,9 @@ public class WindowedDataReader implements DataReader {
     window.gateReason = "engage";
     window.plannedMeta = metaPlan;
     window.plannedData = dataPlan;
-    window.extraBytes = extraBytes;
-    window.savedRoundTrips = saved;
     windowsEngaged++;
+    speculatedBytes += extraBytes;
+    savedRoundTrips += saved;
   }
 
   /** Every footer in the window, plus every index when there is a SARG. */
@@ -697,7 +757,7 @@ public class WindowedDataReader implements DataReader {
       BufferChunkList chunks = rowGroups == null ?
           scratch.planDataReading(TypeReader.ReadPhase.ALL) :
           scratch.planPartialDataReading(index, rowGroups, TypeReader.ReadPhase.ALL);
-      for (BufferChunk chunk = chunks == null ? null : chunks.get();
+      for (BufferChunk chunk = chunks.get();
            chunk != null; chunk = (BufferChunk) chunk.next) {
         selected.add(new long[]{chunk.getOffset(),
             chunk.getOffset() + chunk.getLength()});
@@ -820,8 +880,6 @@ public class WindowedDataReader implements DataReader {
     long end;
     boolean engaged;
     String gateReason = "not-priced";
-    long extraBytes;
-    double savedRoundTrips;
     long[][] plannedMeta;
     long[][] plannedData;
     List<Span> spans;
