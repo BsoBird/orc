@@ -87,7 +87,8 @@ public final class ParallelFooterReader {
    * @throws IOException if any of the footers could not be read
    */
   public static List<OrcTail> readAllTailsInParallel(List<Path> paths,
-                                                     OrcFile.ReaderOptions options) throws IOException {
+                                                     OrcFile.ReaderOptions options)
+      throws IOException {
     return readAllTailsInParallel(paths, options, null);
   }
 
@@ -131,7 +132,8 @@ public final class ParallelFooterReader {
    * @throws IOException if any of the footers could not be read
    */
   public static List<Reader> createAllReadersInParallel(List<Path> paths,
-                                                        OrcFile.ReaderOptions options) throws IOException {
+                                                        OrcFile.ReaderOptions options)
+      throws IOException {
     return createAllReadersInParallel(paths, options, null);
   }
 
