@@ -217,7 +217,8 @@ public class TestStripePruning {
         StandardCharsets.UTF_8);
   }
 
-  private static String hex(byte[] value) {    StringBuilder builder = new StringBuilder(value.length * 2);
+  private static String hex(byte[] value) {
+    StringBuilder builder = new StringBuilder(value.length * 2);
     for (byte b: value) {
       builder.append(String.format("%02x", b));
     }
